@@ -18,7 +18,7 @@ def generate_pitch_geometry(inp: PropellerInput) -> list[GeometryStation]:
     if inp.diameter_m <= 0.0:
         raise ValueError("diameter_m must be positive.")
     r_tip = inp.diameter_m / 2.0
-    r_start = max(inp.hub_diameter_m / 2.0, 0.15 * r_tip)
+    r_start = max(inp.hub_diameter_m / 2.0, 0.20 * r_tip)
     r_end = 0.98 * r_tip
     if r_start >= r_end:
         raise ValueError("hub diameter is too large for the propeller diameter.")

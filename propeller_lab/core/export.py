@@ -52,6 +52,8 @@ def export_summary_csv(result: PropellerResult, path: str | Path) -> None:
         rows.append({"section": "input", "name": key, "value": value})
     for key in ("thrust_N", "torque_Nm", "power_W", "eta", "ct", "cq", "cp"):
         rows.append({"section": "result", "name": key, "value": getattr(result, key)})
+    for key, value in result.diagnostics.items():
+        rows.append({"section": "diagnostic", "name": key, "value": value})
     for idx, warning in enumerate(result.warnings, start=1):
         rows.append({"section": "warning", "name": f"warning_{idx}", "value": warning})
     with csv_path.open("w", encoding="utf-8-sig", newline="") as f:

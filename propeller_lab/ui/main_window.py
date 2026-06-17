@@ -132,10 +132,12 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Model")
         layout = QFormLayout(group)
         self.calc_mode_combo = QComboBox()
+        self.calc_mode_combo.addItem("Auto solver", "auto")
         self.calc_mode_combo.addItem("Simple blade element", "simple")
         self.calc_mode_combo.addItem("Simple blade element + axial induction", "simple_induced")
-        self.calc_mode_combo.addItem("Phi-based BEMT", "bemt_phi")
-        self.calc_mode_combo.setCurrentIndex(1)
+        self.calc_mode_combo.addItem("Forward-flight phi-BEMT", "bemt_phi_forward")
+        self.calc_mode_combo.addItem("Dimensional low-speed BEMT", "bemt_hover_dimensional")
+        self.calc_mode_combo.setCurrentIndex(0)
         self.polar_mode_combo = QComboBox()
         self.polar_mode_combo.addItem("Generic airfoil", "generic")
         self.polar_mode_combo.addItem("Imported polar CSV", "table")
@@ -210,6 +212,16 @@ class MainWindow(QMainWindow):
             ("CT", "CT"),
             ("CQ", "CQ"),
             ("CP", "CP"),
+            ("requested_mode", "requested_mode"),
+            ("actual_mode", "actual_mode"),
+            ("J", "J"),
+            ("mu_adv", "mu_adv"),
+            ("max_alpha_deg", "max_alpha_deg"),
+            ("stall_station_fraction", "stall_station_fraction"),
+            ("low_re_station_fraction", "low_re_station_fraction"),
+            ("negative_thrust_station_fraction", "negative_thrust_station_fraction"),
+            ("max_vi_mps", "max_vi_mps"),
+            ("solver_fallback_fraction", "solver_fallback_fraction"),
         ]:
             value_label = QLabel("-")
             self.summary_labels[key] = value_label
@@ -398,6 +410,8 @@ class MainWindow(QMainWindow):
         self.summary_labels["CT"].setText(_fmt(result.ct))
         self.summary_labels["CQ"].setText(_fmt(result.cq))
         self.summary_labels["CP"].setText(_fmt(result.cp))
+        for key in DIAGNOSTIC_KEYS:
+            self.summary_labels[key].setText(_fmt(result.diagnostics.get(key, "-")))
         self.warning_text.setPlainText("\n".join(result.warnings))
         self.load_plot.update_plot(result.stations)
         self.aero_plot.update_plot(result.stations)
@@ -756,6 +770,18 @@ STATION_COLUMNS = [
 
 SCAN_COLUMNS = ["RPM", "T", "Q", "P", "eta", "CT", "CQ", "CP", "warnings_count"]
 XFOIL_COLUMNS = ["alpha", "Cl", "Cd", "CDp", "Cm", "Xtr_top", "Xtr_bottom"]
+DIAGNOSTIC_KEYS = [
+    "requested_mode",
+    "actual_mode",
+    "J",
+    "mu_adv",
+    "max_alpha_deg",
+    "stall_station_fraction",
+    "low_re_station_fraction",
+    "negative_thrust_station_fraction",
+    "max_vi_mps",
+    "solver_fallback_fraction",
+]
 
 
 def run_app() -> int:

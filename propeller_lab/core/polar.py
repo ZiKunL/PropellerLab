@@ -59,7 +59,11 @@ class GenericPolar(AirfoilPolar):
         cd = self.cd0 + self.k * cl * cl
         if abs(alpha_deg) > 12.0:
             cd += 0.08 * ((abs(alpha_deg) - 12.0) / 10.0) ** 2
-            warnings.append("Possible stall: abs(alpha_deg) > 12.")
+            warnings.append("Possible stall.")
+        if abs(alpha_deg) > 15.0:
+            excess = abs(alpha_deg) - 15.0
+            cl *= max(0.35, 1.0 - 0.025 * excess)
+            cd += 0.15 * (excess / 10.0) ** 2 + 0.01 * excess
         if reynolds is not None and reynolds < 50000.0:
             warnings.append("Low Reynolds number: polar accuracy may be poor.")
         if mach is not None and mach > 0.6:

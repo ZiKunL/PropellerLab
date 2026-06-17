@@ -21,7 +21,7 @@ class PropellerInput:
     mu: float = 1.81e-5
     sound_speed: float = 343.0
     elements: int = 50
-    calculation_mode: str = "simple_induced"
+    calculation_mode: str = "auto"
     polar_mode: str = "generic"
     use_tip_loss: bool = True
     use_hub_loss: bool = True
@@ -101,3 +101,4 @@ class PropellerResult:
     cp: float
     stations: list[StationResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    diagnostics: dict[str, float | str] = field(default_factory=dict)

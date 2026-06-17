@@ -18,6 +18,10 @@ def test_default_input_calculates_and_exports(tmp_path):
     assert len(result.stations) == inp.elements
     for value in (result.thrust_N, result.torque_Nm, result.power_W, result.ct, result.cq, result.cp):
         assert math.isfinite(value)
+    assert result.diagnostics["requested_mode"] == "auto"
+    assert result.diagnostics["actual_mode"] == "bemt_hover_dimensional"
+    assert "J" in result.diagnostics
+    assert "mu_adv" in result.diagnostics
 
     station_path = tmp_path / "stations.csv"
     summary_path = tmp_path / "summary.csv"
