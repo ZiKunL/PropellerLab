@@ -1,0 +1,10 @@
+r_over_R,chord_over_R,beta_deg,airfoil_id
+0.20,0.16,32,generic
+0.30,0.15,26,generic
+0.40,0.13,21,generic
+0.50,0.11,17,generic
+0.60,0.095,14,generic
+0.70,0.080,12,generic
+0.80,0.065,10,generic
+0.90,0.050,8,generic
+0.95,0.040,7,generic
