@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -32,6 +32,7 @@ class XfoilRunResult:
     warnings: list[str]
     polar_path: Path | None
     csv_path: Path | None
+    reynolds_tables: dict[float, list[XfoilPolarPoint]] = field(default_factory=dict)
 
 
 class XfoilRunner:
@@ -241,10 +242,10 @@ class XfoilRunner:
             warnings.append("XFOIL timed out.")
         except FileNotFoundError:
             warnings.append("XFOIL executable was not found.")
-            return XfoilRunResult([], stdout, stderr, warnings, None, csv_path)
+            return XfoilRunResult([], stdout, stderr, warnings, None, csv_path, {})
         except Exception as exc:  # noqa: BLE001 - errors are reported to the UI as warnings.
             warnings.append(f"XFOIL failed: {exc}")
-            return XfoilRunResult([], stdout, stderr, warnings, None, csv_path)
+            return XfoilRunResult([], stdout, stderr, warnings, None, csv_path, {})
 
         points = self.parse_xfoil_polar(polar_path)
         if not points:
@@ -253,7 +254,8 @@ class XfoilRunner:
             self.export_xfoil_points_to_csv(points, csv_path)
         if points and _expected_alpha_count(alpha_start, alpha_end, alpha_step) > len(points):
             warnings.append("Some requested alpha points may be missing due to non-convergence.")
-        return XfoilRunResult(points, stdout, stderr, _unique(warnings), polar_path, csv_path)
+        tables = {float(reynolds): points} if points else {}
+        return XfoilRunResult(points, stdout, stderr, _unique(warnings), polar_path, csv_path, tables)
 
     @staticmethod
     def _build_script(

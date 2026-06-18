@@ -13,6 +13,8 @@ class PropellerInput:
     diameter_m: float = 0.254
     hub_diameter_m: float = 0.035
     pitch_m: float = 0.1143
+    pitch_input_mode: str = "pitch"
+    pitch_angle_deg: float = 11.568
     root_chord_ratio: float = 0.16
     tip_chord_ratio: float = 0.06
     rpm: float = 8000.0

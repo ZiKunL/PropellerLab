@@ -157,7 +157,46 @@ r_start = max(hub_diameter_m / 2, 0.20 * R)
 
 在启用 hub loss 时，桨毂半径也用于 Prandtl root loss 计算。
 
-### 2.4 Pitch P, m
+### 2.4 Pitch input
+
+UI 名称：
+
+```text
+Pitch input
+```
+
+代码控件：
+
+```python
+self.pitch_input_combo = QComboBox()
+self.pitch_input_combo.addItem("Pitch P, m", "pitch")
+self.pitch_input_combo.addItem("Pitch angle at 70%R, deg", "pitch_angle")
+```
+
+含义：
+
+选择桨距输入方式。
+
+当前支持两种互斥输入：
+
+- `Pitch P, m`：直接输入几何桨距，单位 m
+- `Pitch angle at 70%R, deg`：输入展向 70% 半径处的桨距角，单位 deg
+
+默认值：
+
+```text
+Pitch P, m
+```
+
+作用：
+
+该选项保证 `Pitch P, m` 和 `Pitch angle at 70%R, deg` 二选一生效。
+
+当选择 `Pitch P, m` 时，Pitch 输入框可编辑，Pitch angle 输入框只显示换算结果。
+
+当选择 `Pitch angle at 70%R, deg` 时，Pitch angle 输入框可编辑，程序会自动换算出 Pitch，并显示在 Pitch 输入框中。
+
+### 2.5 Pitch P, m
 
 UI 名称：
 
@@ -211,7 +250,65 @@ beta_deg = degrees(beta)
 - 靠近桨根，`r` 较小，`beta` 较大
 - 靠近桨尖，`r` 较大，`beta` 较小
 
-### 2.5 Root chord c_root/R
+### 2.6 Pitch angle at 70%R, deg
+
+UI 名称：
+
+```text
+Pitch angle at 70%R, deg
+```
+
+代码控件：
+
+```python
+self.pitch_angle_spin = _spin_float(0.0, 89.0, 11.568, 3, 0.1)
+```
+
+含义：
+
+展向 70% 半径位置处的局部桨距角，单位 deg。
+
+这里的 70% 半径位置是：
+
+```text
+r_ref = 0.70 * R
+```
+
+其中：
+
+```text
+R = D / 2
+```
+
+默认值：
+
+```text
+11.568 deg
+```
+
+输入范围：
+
+```text
+0.0 deg 到 89.0 deg
+```
+
+作用：
+
+当 Pitch input 选择 `Pitch angle at 70%R, deg` 时，程序用该角度反算几何桨距：
+
+```text
+Pitch = 2*pi*(0.70*R)*tan(Pitch_angle)
+```
+
+然后现有几何生成仍然使用换算出的 `pitch_m`，所以不会和原来的 Pitch 工作流冲突。
+
+注意：
+
+该角度是 70% 半径处的局部桨距角，不是所有半径位置的统一安装角。
+
+其他半径位置的 `beta_deg` 仍会根据换算出的 Pitch 和当地半径 `r` 重新计算。
+
+### 2.7 Root chord c_root/R
 
 UI 名称：
 
@@ -251,7 +348,7 @@ self.root_chord_spin = _spin_float(0.001, 1.0, 0.16, 4, 0.001)
 chord_m = chord_over_R * R
 ```
 
-### 2.6 Tip chord c_tip/R
+### 2.8 Tip chord c_tip/R
 
 UI 名称：
 
@@ -287,7 +384,7 @@ self.tip_chord_spin = _spin_float(0.001, 1.0, 0.06, 4, 0.001)
 
 程序会在根部弦长比和桨尖弦长比之间做线性插值，生成每个径向站位的 `chord_over_R`。
 
-### 2.7 Elements
+### 2.9 Elements
 
 UI 名称：
 
@@ -1386,6 +1483,12 @@ mu_adv = V_inf / (omega * R)
 
 `pitch_m` 是全局几何桨距，`beta_deg` 是某个半径位置的局部桨距角。
 
+如果使用 `Pitch angle at 70%R, deg` 输入，程序会先按 70% 半径位置反算 `pitch_m`：
+
+```text
+pitch_m = 2*pi*(0.70*R)*tan(pitch_angle_deg)
+```
+
 程序根据 `pitch_m` 和局部半径 `r` 生成：
 
 ```text
@@ -1451,7 +1554,9 @@ Mach = W / sound_speed
 | Blades B | 2 |
 | Diameter D, m | 0.254 |
 | Hub diameter, m | 0.035 |
+| Pitch input | Pitch P, m |
 | Pitch P, m | 0.1143 |
+| Pitch angle at 70%R, deg | 11.568 |
 | Root chord c_root/R | 0.16 |
 | Tip chord c_tip/R | 0.06 |
 | Elements | 50 |
@@ -1465,3 +1570,146 @@ Mach = W / sound_speed
 | Use tip loss | enabled |
 | Use hub loss | enabled |
 
+## 11. Reynolds 范围估算与 XFOIL 多雷诺数扫描
+
+本节说明本次新增的 XFOIL 辅助输入。它们位于右侧 `XFOIL polar generator` 页面，用于根据当前螺旋桨几何和工况自动估计翼型 polar 需要覆盖的 Reynolds 数范围。
+
+### 11.1 Auto Re range
+
+UI 名称：
+```text
+Auto Re range
+```
+
+含义：
+是否自动根据当前输入刷新 `Re min`、`Re max` 和单点 `Reynolds`。
+
+默认状态：
+```text
+enabled
+```
+
+触发条件：
+当以下输入变化时，程序会静默重新估算 Reynolds 范围：
+- Diameter D, m
+- Hub diameter, m
+- Pitch P, m
+- Pitch angle at 70%R, deg
+- Root chord c_root/R
+- Tip chord c_tip/R
+- Elements
+- RPM
+- Freestream velocity V_inf, m/s
+- Density rho
+- Dynamic viscosity mu
+- Re count
+
+估算公式：
+```text
+omega = 2*pi*RPM/60
+W = sqrt(V_inf^2 + (omega*r)^2)
+chord = chord_over_R * R
+Re = rho * W * chord / mu
+```
+
+程序会沿当前叶素站位计算每个站位的 `Re`，然后取最小值作为 `Re min`，最大值作为 `Re max`。
+
+### 11.2 Estimate Re range
+
+UI 名称：
+```text
+Estimate Re range
+```
+
+含义：
+手动执行一次 Reynolds 范围估算。
+
+作用：
+点击后会：
+- 根据当前几何和工况刷新 `Re min`、`Re max`
+- 根据 `Re count` 生成若干代表性 Reynolds 数
+- 把代表性 Reynolds 数写入 XFOIL 日志
+- 自动勾选 `Use multi-Re sweep`
+
+### 11.3 Use multi-Re sweep
+
+UI 名称：
+```text
+Use multi-Re sweep
+```
+
+含义：
+控制 XFOIL 是只计算一个 Reynolds，还是在 `Re min` 到 `Re max` 之间计算多个 Reynolds。
+
+未勾选时：
+```text
+XFOIL 只使用 Reynolds 输入框中的单个 Re 值。
+```
+
+勾选时：
+```text
+XFOIL 会根据 Re min、Re max 和 Re count 生成多个 Re 值，并分别运行 polar 扫描。
+```
+
+### 11.4 Re min
+
+UI 名称：
+```text
+Re min
+```
+
+含义：
+XFOIL 多 Reynolds 扫描的下限。
+
+来源：
+通常由 `Auto Re range` 或 `Estimate Re range` 自动填入，也可以手动修改。
+
+### 11.5 Re max
+
+UI 名称：
+```text
+Re max
+```
+
+含义：
+XFOIL 多 Reynolds 扫描的上限。
+
+来源：
+通常由 `Auto Re range` 或 `Estimate Re range` 自动填入，也可以手动修改。
+
+### 11.6 Re count
+
+UI 名称：
+```text
+Re count
+```
+
+含义：
+在 `Re min` 到 `Re max` 范围内选取多少个代表性 Reynolds 数用于 XFOIL 计算。
+
+默认值：
+```text
+3
+```
+
+范围：
+```text
+1 到 7
+```
+
+取值规则：
+如果 `Re max / Re min` 较大，程序使用近似对数分布，避免低 Reynolds 区域采样过少；如果范围较窄，则使用线性分布。
+
+### 11.7 多 Reynolds polar 在 BEMT 中如何使用
+
+当 `Use multi-Re sweep` 启用并且 XFOIL 成功生成至少两个可用 Reynolds 表后，点击：
+```text
+Use as current polar
+```
+
+程序会把这些表组合为 `MultiRePolar`。后续 BEMT 计算每个叶素站位时，会把该站位自己的 Reynolds 数传给 polar 查询函数：
+```text
+Cl, Cd, Cm = polar.lookup(alpha, station_Re, station_Mach)
+```
+
+因此，计算不会只使用单一 Reynolds 表，而是在 XFOIL 生成的多个 Reynolds 表之间插值。这样对于根部、桨尖和中间展向位置 Reynolds 差异较大的螺旋桨，会比单 Re polar 更贴近真实工况。
