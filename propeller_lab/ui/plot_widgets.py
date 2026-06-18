@@ -12,6 +12,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
+from propeller_lab.core.design import DesignStationResult
 from propeller_lab.core.models import StationResult
 from propeller_lab.core.xfoil_runner import XfoilPolarPoint
 
@@ -119,6 +120,30 @@ class PolarPlotWidget(_BasePlotWidget):
             ax.plot(alpha, values, label=ylabel)
             ax.set_title(title)
             ax.set_xlabel("alpha, deg")
+            ax.set_ylabel(ylabel)
+            ax.grid(True)
+        self._redraw()
+
+
+class DesignPlotWidget(_BasePlotWidget):
+    """Plot twist design station values."""
+
+    def update_plot(self, stations: list[DesignStationResult]) -> None:
+        """Update beta, alpha, chord, and Cl/Cd against radius ratio."""
+
+        self.figure.clear()
+        r = [s.r_over_R for s in stations]
+        axes = [self.figure.add_subplot(2, 2, i + 1) for i in range(4)]
+        series = [
+            ("beta_deg", [s.beta_deg for s in stations], "deg"),
+            ("alpha_design_deg", [s.alpha_design_deg for s in stations], "deg"),
+            ("chord/R", [s.chord_over_R for s in stations], "chord/R"),
+            ("Cl/Cd", [s.ld for s in stations], "Cl/Cd"),
+        ]
+        for ax, (title, values, ylabel) in zip(axes, series):
+            ax.plot(r, values, label=title)
+            ax.set_title(title)
+            ax.set_xlabel("r/R")
             ax.set_ylabel(ylabel)
             ax.grid(True)
         self._redraw()

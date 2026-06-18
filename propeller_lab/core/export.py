@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .design import DesignResult
 from .models import PropellerResult
 
 
@@ -72,3 +73,31 @@ def export_scan_csv(scan_rows: list[dict[str, Any]], path: str | Path) -> None:
         writer.writeheader()
         for row in scan_rows:
             writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+
+def export_design_station_csv(design_result: DesignResult, path: str | Path) -> None:
+    """Export design station rows to CSV."""
+
+    fieldnames = [
+        "r_over_R",
+        "r_m",
+        "chord_over_R",
+        "chord_m",
+        "phi_deg",
+        "alpha_design_deg",
+        "beta_deg",
+        "reynolds",
+        "mach",
+        "cl",
+        "cd",
+        "cm",
+        "ld",
+        "objective_value",
+        "warning",
+    ]
+    csv_path = Path(path)
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for station in design_result.stations:
+            writer.writerow({name: getattr(station, name) for name in fieldnames})

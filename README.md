@@ -40,6 +40,15 @@ The direct script entry point is also supported:
 python propeller_lab/main.py
 ```
 
+## Workspaces
+
+PropellerLab has two top-level workspaces:
+
+- Base Calculate: direct propeller analysis, geometry and polar import/export, RPM sweep, XFOIL polar generation, multi-Re XFOIL workflow, and auto Re range estimation.
+- Optimization Design: early propeller design workflow that generates a new twist distribution and can apply it back to Base Calculate.
+
+The Workspace selector switches between these two workflows. Applying a generated design replaces the active custom geometry in Base Calculate and runs a new analysis.
+
 ## Testing
 
 ```bash
@@ -82,6 +91,30 @@ The converted pitch then feeds the existing radial beta generation:
 ```text
 beta = atan(P / (2*pi*r))
 ```
+
+## Optimization Design workspace
+
+Optimization Design currently implements an early twist design workflow. The first method is Max Cl/Cd Twist Design. It uses the active polar and current geometry, estimates local inflow angle, selects a design angle of attack, and sets:
+
+```text
+beta = phi + alpha_design
+```
+
+The generated geometry keeps the chord distribution by default. The result is analyzed with the existing auto solver, then it can be applied to Base Calculate as the active custom geometry.
+
+Available design targets:
+
+- No target: generate twist directly from the selected alpha objective.
+- Target thrust: use a simple global beta offset to approach a requested thrust.
+- Target power: use a simple global beta offset to approach a requested shaft power.
+
+Available alpha objectives:
+
+- Max Cl/Cd.
+- Max local thrust/torque ratio.
+- Fixed alpha.
+
+Important limitation: local maximum Cl/Cd is not a complete global optimum propeller design. Full optimum propeller design would require chord optimization, induced-loss optimization, structural limits, noise limits, multi-point operating conditions, and validation with experiments or higher-fidelity tools.
 
 ## Low-speed and static thrust handling
 

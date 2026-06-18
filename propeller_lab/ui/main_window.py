@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -36,7 +37,8 @@ from PySide6.QtWidgets import (
 )
 
 from propeller_lab.core.bemt import calculate_propeller
-from propeller_lab.core.export import export_scan_csv, export_station_csv, export_summary_csv
+from propeller_lab.core.design import DesignInput, DesignResult, clone_geometry, design_twist_with_target
+from propeller_lab.core.export import export_design_station_csv, export_scan_csv, export_station_csv, export_summary_csv
 from propeller_lab.core.geometry import (
     estimate_reynolds_range,
     generate_pitch_geometry,
@@ -49,7 +51,8 @@ from propeller_lab.core.geometry import (
 from propeller_lab.core.models import GeometryStation, PolarPoint, PropellerInput, PropellerResult
 from propeller_lab.core.polar import AirfoilPolar, MultiRePolar, TablePolar
 from propeller_lab.core.xfoil_runner import XfoilPolarPoint, XfoilRunResult, XfoilRunner
-from propeller_lab.ui.plot_widgets import AeroPlotWidget, LoadPlotWidget, PolarPlotWidget, ScanPlotWidget
+from propeller_lab.ui.app_state import AppState
+from propeller_lab.ui.plot_widgets import AeroPlotWidget, DesignPlotWidget, LoadPlotWidget, PolarPlotWidget, ScanPlotWidget
 from propeller_lab.ui.xfoil_worker import XfoilWorker
 
 
@@ -61,9 +64,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PropellerLab - Propeller Thrust and Torque Calculator")
         self.resize(1280, 820)
 
-        self.current_result: PropellerResult | None = None
-        self.current_geometry: list[GeometryStation] | None = None
-        self.current_polar: AirfoilPolar | None = None
+        self.app_state = AppState(prop_input=PropellerInput())
+        self.current_result = None
+        self.current_geometry = None
+        self.current_polar = None
         self.xfoil_points: list[XfoilPolarPoint] = []
         self.xfoil_reynolds_tables: dict[float, list[XfoilPolarPoint]] = {}
         self.scan_rows: list[dict[str, float | int]] = []
@@ -71,13 +75,60 @@ class MainWindow(QMainWindow):
         self.xfoil_worker: XfoilWorker | None = None
         self._pitch_syncing = False
 
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(6, 6, 6, 6)
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel("Workspace:"))
+        self.workspace_combo = QComboBox()
+        self.workspace_combo.addItem("Base Calculate")
+        self.workspace_combo.addItem("Optimization Design")
+        top_bar.addWidget(self.workspace_combo)
+        top_bar.addStretch(1)
+        central_layout.addLayout(top_bar)
+
+        self.workspace_stack = QStackedWidget()
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_input_panel())
         splitter.addWidget(self._build_tabs())
         splitter.setSizes([360, 920])
-        self.setCentralWidget(splitter)
+        self.workspace_stack.addWidget(splitter)
+        self.workspace_stack.addWidget(self._build_design_workspace())
+        central_layout.addWidget(self.workspace_stack, 1)
+        self.workspace_combo.currentIndexChanged.connect(self.workspace_stack.setCurrentIndex)
+        self.setCentralWidget(central)
         self._connect_re_range_inputs()
         self._update_re_range_from_inputs(log=False, show_errors=False)
+
+    @property
+    def current_result(self) -> PropellerResult | None:
+        """Return the last Base Calculate result."""
+
+        return self.app_state.last_analysis_result
+
+    @current_result.setter
+    def current_result(self, value: PropellerResult | None) -> None:
+        self.app_state.last_analysis_result = value
+
+    @property
+    def current_geometry(self) -> list[GeometryStation] | None:
+        """Return the active shared geometry."""
+
+        return self.app_state.current_geometry
+
+    @current_geometry.setter
+    def current_geometry(self, value: list[GeometryStation] | None) -> None:
+        self.app_state.current_geometry = value
+
+    @property
+    def current_polar(self) -> AirfoilPolar | None:
+        """Return the active shared polar."""
+
+        return self.app_state.current_polar
+
+    @current_polar.setter
+    def current_polar(self, value: AirfoilPolar | None) -> None:
+        self.app_state.current_polar = value
 
     def _build_input_panel(self) -> QWidget:
         """Build the left input panel."""
@@ -170,7 +221,7 @@ class MainWindow(QMainWindow):
         self.tip_loss_check.setChecked(True)
         self.hub_loss_check = QCheckBox("Use hub loss")
         self.hub_loss_check.setChecked(True)
-        layout.addRow("Calculation mode", self.calc_mode_combo)
+        layout.addRow("Solver mode", self.calc_mode_combo)
         layout.addRow("Polar mode", self.polar_mode_combo)
         layout.addRow(self.tip_loss_check)
         layout.addRow(self.hub_loss_check)
@@ -394,10 +445,167 @@ class MainWindow(QMainWindow):
         self.use_xfoil_button.clicked.connect(self.use_xfoil_polar)
         return widget
 
+    def _build_design_workspace(self) -> QWidget:
+        """Build the Optimization Design workspace."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.addWidget(self._design_method_group())
+        controls_layout.addWidget(self._design_objective_group())
+        controls_layout.addWidget(self._design_constraints_group())
+        controls_layout.addWidget(self._design_button_group())
+        controls_layout.addStretch(1)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setWidget(controls)
+        splitter.addWidget(controls_scroll)
+        splitter.addWidget(self._design_output_tabs())
+        splitter.setSizes([380, 900])
+        layout.addWidget(splitter)
+        return widget
+
+    def _design_method_group(self) -> QGroupBox:
+        """Build design method and condition controls."""
+
+        group = QGroupBox("Design method")
+        layout = QFormLayout(group)
+        self.design_method_combo = QComboBox()
+        self.design_method_combo.addItem("Max Cl/Cd Twist Design", "none")
+        self.design_method_combo.addItem("Target Thrust Twist Design", "thrust")
+        self.design_method_combo.addItem("Target Power Twist Design", "power")
+        self.design_rpm_spin = _spin_float(0.0, 200000.0, self.rpm_spin.value(), 1, 100.0)
+        self.design_vinf_spin = _spin_float(0.0, 400.0, self.vinf_spin.value(), 3, 0.1)
+        self.design_target_type_combo = QComboBox()
+        self.design_target_type_combo.addItem("None", "none")
+        self.design_target_type_combo.addItem("Target thrust", "thrust")
+        self.design_target_type_combo.addItem("Target power", "power")
+        self.design_target_value_spin = _spin_float(0.0, 1000000.0, 0.0, 3, 1.0)
+        layout.addRow("Design method", self.design_method_combo)
+        layout.addRow("Design RPM", self.design_rpm_spin)
+        layout.addRow("Design V_inf, m/s", self.design_vinf_spin)
+        layout.addRow("Target type", self.design_target_type_combo)
+        layout.addRow("Target value", self.design_target_value_spin)
+        self.design_method_combo.currentIndexChanged.connect(self._sync_design_method_target)
+        return group
+
+    def _design_objective_group(self) -> QGroupBox:
+        """Build alpha objective controls."""
+
+        group = QGroupBox("Alpha objective")
+        layout = QFormLayout(group)
+        self.design_alpha_objective_combo = QComboBox()
+        self.design_alpha_objective_combo.addItem("Max Cl/Cd", "max_ld")
+        self.design_alpha_objective_combo.addItem("Max local thrust/torque ratio", "max_local_efficiency")
+        self.design_alpha_objective_combo.addItem("Fixed alpha", "fixed_alpha")
+        self.design_fixed_alpha_spin = _spin_float(-20.0, 30.0, 5.0, 2, 0.25)
+        self.design_alpha_min_spin = _spin_float(-30.0, 30.0, -4.0, 2, 0.25)
+        self.design_alpha_max_spin = _spin_float(-30.0, 40.0, 12.0, 2, 0.25)
+        self.design_alpha_step_spin = _spin_float(0.05, 5.0, 0.25, 2, 0.05)
+        self.design_stall_margin_spin = _spin_float(0.0, 10.0, 2.0, 2, 0.25)
+        self.design_max_cl_fraction_spin = _spin_float(0.1, 1.0, 0.85, 3, 0.05)
+        layout.addRow("Alpha objective", self.design_alpha_objective_combo)
+        layout.addRow("Fixed alpha, deg", self.design_fixed_alpha_spin)
+        layout.addRow("Alpha min, deg", self.design_alpha_min_spin)
+        layout.addRow("Alpha max, deg", self.design_alpha_max_spin)
+        layout.addRow("Alpha step, deg", self.design_alpha_step_spin)
+        layout.addRow("Stall margin, deg", self.design_stall_margin_spin)
+        layout.addRow("Max Cl fraction", self.design_max_cl_fraction_spin)
+        return group
+
+    def _design_constraints_group(self) -> QGroupBox:
+        """Build design constraints controls."""
+
+        group = QGroupBox("Constraints")
+        layout = QFormLayout(group)
+        self.design_beta_min_spin = _spin_float(-20.0, 80.0, 0.0, 2, 0.5)
+        self.design_beta_max_spin = _spin_float(-20.0, 90.0, 60.0, 2, 0.5)
+        self.design_max_tip_mach_spin = _spin_float(0.1, 2.0, 0.75, 3, 0.05)
+        self.design_chord_mode_combo = QComboBox()
+        self.design_chord_mode_combo.addItem("Keep current chord", "keep_current")
+        self.design_chord_mode_combo.addItem("Linear chord", "linear")
+        self.design_allow_beta_offset_check = QCheckBox("Allow beta offset")
+        self.design_allow_beta_offset_check.setChecked(True)
+        layout.addRow("Beta min, deg", self.design_beta_min_spin)
+        layout.addRow("Beta max, deg", self.design_beta_max_spin)
+        layout.addRow("Max tip Mach", self.design_max_tip_mach_spin)
+        layout.addRow("Chord mode", self.design_chord_mode_combo)
+        layout.addRow(self.design_allow_beta_offset_check)
+        return group
+
+    def _design_button_group(self) -> QGroupBox:
+        """Build design action buttons."""
+
+        group = QGroupBox("Actions")
+        layout = QGridLayout(group)
+        self.generate_design_button = QPushButton("Generate design")
+        self.analyze_design_button = QPushButton("Analyze generated design")
+        self.apply_design_button = QPushButton("Apply to Base Calculate")
+        self.export_design_geometry_button = QPushButton("Export designed geometry CSV")
+        self.export_design_station_button = QPushButton("Export design station CSV")
+        buttons = [
+            self.generate_design_button,
+            self.analyze_design_button,
+            self.apply_design_button,
+            self.export_design_geometry_button,
+            self.export_design_station_button,
+        ]
+        for idx, button in enumerate(buttons):
+            layout.addWidget(button, idx, 0)
+        self.generate_design_button.clicked.connect(self.generate_design)
+        self.analyze_design_button.clicked.connect(self.analyze_generated_design)
+        self.apply_design_button.clicked.connect(self.apply_design_to_base)
+        self.export_design_geometry_button.clicked.connect(self.export_design_geometry)
+        self.export_design_station_button.clicked.connect(self.export_design_station_csv)
+        return group
+
+    def _design_output_tabs(self) -> QTabWidget:
+        """Build design result tabs."""
+
+        tabs = QTabWidget()
+        tabs.addTab(self._design_summary_tab(), "Design summary")
+        tabs.addTab(self._design_station_table_tab(), "Design station table")
+        self.design_plot = DesignPlotWidget()
+        tabs.addTab(self.design_plot, "Design plots")
+        return tabs
+
+    def _design_summary_tab(self) -> QWidget:
+        """Build design summary tab."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        form = QFormLayout()
+        self.design_summary_labels: dict[str, QLabel] = {}
+        for key, label in DESIGN_SUMMARY_ROWS:
+            value_label = QLabel("-")
+            self.design_summary_labels[key] = value_label
+            form.addRow(label, value_label)
+        layout.addLayout(form)
+        self.design_warning_text = QTextEdit()
+        self.design_warning_text.setReadOnly(True)
+        self.design_warning_text.setPlaceholderText("Design warnings")
+        layout.addWidget(self.design_warning_text, 1)
+        return widget
+
+    def _design_station_table_tab(self) -> QWidget:
+        """Build design station table tab."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self.design_station_table = QTableWidget(0, len(DESIGN_COLUMNS))
+        self.design_station_table.setHorizontalHeaderLabels([label for label, _attr in DESIGN_COLUMNS])
+        self.design_station_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.design_station_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.design_station_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.design_station_table)
+        return widget
+
     def _input(self) -> PropellerInput:
         """Read PropellerInput from controls."""
 
-        return PropellerInput(
+        inp = PropellerInput(
             blades=self.blades_spin.value(),
             diameter_m=self.diameter_spin.value(),
             hub_diameter_m=self.hub_spin.value(),
@@ -417,6 +625,8 @@ class MainWindow(QMainWindow):
             use_tip_loss=self.tip_loss_check.isChecked(),
             use_hub_loss=self.hub_loss_check.isChecked(),
         )
+        self.app_state.prop_input = inp
+        return inp
 
     def _current_pitch_m(self) -> float:
         """Return the current pitch in meters from the active pitch input."""
@@ -483,6 +693,162 @@ class MainWindow(QMainWindow):
         if self.current_polar is None:
             raise ValueError("No imported or XFOIL polar is available.")
         return self.current_polar
+
+    def _design_polar(self) -> AirfoilPolar | None:
+        """Return the active polar for design, or None for GenericPolar."""
+
+        return self._selected_polar()
+
+    def _design_input(self) -> DesignInput:
+        """Read DesignInput from design controls."""
+
+        target_type = str(self.design_target_type_combo.currentData())
+        target_value = self.design_target_value_spin.value() if target_type != "none" else 0.0
+        return DesignInput(
+            rpm=self.design_rpm_spin.value(),
+            v_inf=self.design_vinf_spin.value(),
+            rho=self.rho_spin.value(),
+            mu=self.mu_spin.value(),
+            sound_speed=self.sound_speed_spin.value(),
+            target_type=target_type,
+            target_value=target_value,
+            objective=str(self.design_alpha_objective_combo.currentData()),
+            chord_mode=str(self.design_chord_mode_combo.currentData()),
+            alpha_min_deg=self.design_alpha_min_spin.value(),
+            alpha_max_deg=self.design_alpha_max_spin.value(),
+            alpha_step_deg=self.design_alpha_step_spin.value(),
+            stall_margin_deg=self.design_stall_margin_spin.value(),
+            max_cl_fraction=self.design_max_cl_fraction_spin.value(),
+            fixed_alpha_deg=self.design_fixed_alpha_spin.value(),
+            beta_min_deg=self.design_beta_min_spin.value(),
+            beta_max_deg=self.design_beta_max_spin.value(),
+            max_tip_mach=self.design_max_tip_mach_spin.value(),
+            allow_beta_offset=self.design_allow_beta_offset_check.isChecked(),
+        )
+
+    def _sync_design_method_target(self) -> None:
+        """Keep the target selector aligned with the selected design method."""
+
+        target_type = str(self.design_method_combo.currentData())
+        index = self.design_target_type_combo.findData(target_type)
+        if index >= 0:
+            self.design_target_type_combo.setCurrentIndex(index)
+
+    def generate_design(self) -> None:
+        """Generate a twist design from the current inputs."""
+
+        try:
+            result = design_twist_with_target(
+                self._input(),
+                self._design_input(),
+                polar=self._design_polar(),
+                base_geometry=self.current_geometry,
+            )
+            self.app_state.last_design_result = result
+            self._show_design_result(result)
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Design failed", str(exc))
+
+    def analyze_generated_design(self) -> None:
+        """Re-analyze the current generated design geometry."""
+
+        result = self.app_state.last_design_result
+        if result is None:
+            QMessageBox.information(self, "No design", "Please generate a design first.")
+            return
+        try:
+            design_input = self._design_input()
+            analysis_input = replace(
+                self._input(),
+                rpm=design_input.rpm,
+                v_inf=design_input.v_inf,
+                rho=design_input.rho,
+                mu=design_input.mu,
+                sound_speed=design_input.sound_speed,
+                calculation_mode="auto",
+            )
+            analysis_result = calculate_propeller(analysis_input, polar=self._design_polar(), geometry=result.geometry)
+            updated = replace(result, design_input=design_input, analysis_result=analysis_result)
+            self.app_state.last_design_result = updated
+            self._show_design_result(updated)
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Design analysis failed", str(exc))
+
+    def apply_design_to_base(self) -> None:
+        """Apply the generated design geometry to Base Calculate."""
+
+        result = self.app_state.last_design_result
+        if result is None:
+            QMessageBox.information(self, "No design", "Please generate a design first.")
+            return
+        self.current_geometry = clone_geometry(result.geometry)
+        self.elements_spin.setValue(len(result.geometry))
+        self._auto_estimate_re_range()
+        self.workspace_combo.setCurrentIndex(0)
+        self.calculate()
+
+    def export_design_geometry(self) -> None:
+        """Export the generated design geometry."""
+
+        result = self.app_state.last_design_result
+        if result is None:
+            QMessageBox.information(self, "No design", "Please generate a design first.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(self, "Export designed geometry CSV", "designed_geometry.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            save_geometry_csv(result.geometry, path)
+            QMessageBox.information(self, "Geometry exported", "Designed geometry CSV was written.")
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Design geometry export failed", str(exc))
+
+    def export_design_station_csv(self) -> None:
+        """Export the generated design station table."""
+
+        result = self.app_state.last_design_result
+        if result is None:
+            QMessageBox.information(self, "No design", "Please generate a design first.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(self, "Export design station CSV", "design_stations.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            export_design_station_csv(result, path)
+            QMessageBox.information(self, "Design exported", "Design station CSV was written.")
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Design station export failed", str(exc))
+
+    def _show_design_result(self, result: DesignResult) -> None:
+        """Refresh design summary, table, and plots."""
+
+        analysis = result.analysis_result
+        target_error = result.diagnostics.get("target_error_fraction", 0.0)
+        values: dict[str, object] = {
+            "T": analysis.thrust_N if analysis is not None else 0.0,
+            "Q": analysis.torque_Nm if analysis is not None else 0.0,
+            "P": analysis.power_W if analysis is not None else 0.0,
+            "eta": analysis.eta if analysis is not None else 0.0,
+            "CT": analysis.ct if analysis is not None else 0.0,
+            "CP": analysis.cp if analysis is not None else 0.0,
+            "target_error": target_error,
+            "objective": result.design_input.objective,
+            "target_type": result.design_input.target_type,
+        }
+        for key, label in self.design_summary_labels.items():
+            label.setText(_fmt(values.get(key, result.diagnostics.get(key, "-"))))
+        self.design_warning_text.setPlainText("\n".join(result.warnings))
+        self._fill_design_station_table(result.stations)
+        self.design_plot.update_plot(result.stations)
+
+    def _fill_design_station_table(self, stations: list[Any]) -> None:
+        """Populate the design station table."""
+
+        self.design_station_table.setRowCount(len(stations))
+        for row, station in enumerate(stations):
+            for col, (_label, attr) in enumerate(DESIGN_COLUMNS):
+                value = getattr(station, attr)
+                self.design_station_table.setItem(row, col, QTableWidgetItem(_fmt(value) if isinstance(value, float) else str(value)))
 
     def calculate(self) -> None:
         """Run one propeller calculation."""
@@ -888,6 +1254,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Polar unavailable", "At least 2 Reynolds tables with 5 points each are required.")
                 return
             self.current_polar = multi
+            self.app_state.xfoil_cached_polar = multi
             self.polar_mode_combo.setCurrentIndex(2)
             QMessageBox.information(self, "Polar active", "Multi-Re XFOIL polar is now the current polar.")
             return
@@ -904,6 +1271,7 @@ class MainWindow(QMainWindow):
             for p in self.xfoil_points
         ]
         self.current_polar = TablePolar(points)
+        self.app_state.xfoil_cached_polar = self.current_polar
         self.polar_mode_combo.setCurrentIndex(2)
         QMessageBox.information(self, "Polar active", "XFOIL polar is now the current polar.")
 
@@ -986,6 +1354,39 @@ STATION_COLUMNS = [
 
 SCAN_COLUMNS = ["RPM", "T", "Q", "P", "eta", "CT", "CQ", "CP", "warnings_count"]
 XFOIL_COLUMNS = ["alpha", "Cl", "Cd", "CDp", "Cm", "Xtr_top", "Xtr_bottom"]
+DESIGN_SUMMARY_ROWS = [
+    ("T", "predicted T, N"),
+    ("Q", "predicted Q, N*m"),
+    ("P", "predicted P, W"),
+    ("eta", "predicted eta"),
+    ("CT", "CT"),
+    ("CP", "CP"),
+    ("target_error", "target error"),
+    ("objective", "objective"),
+    ("target_type", "target_type"),
+    ("max_beta_deg", "max_beta_deg"),
+    ("min_beta_deg", "min_beta_deg"),
+    ("max_alpha_design_deg", "max_alpha_design_deg"),
+    ("min_alpha_design_deg", "min_alpha_design_deg"),
+    ("max_mach", "max_mach"),
+    ("max_reynolds", "max_reynolds"),
+    ("min_reynolds", "min_reynolds"),
+    ("stations_with_warnings", "stations_with_warnings"),
+]
+DESIGN_COLUMNS = [
+    ("r/R", "r_over_R"),
+    ("chord/R", "chord_over_R"),
+    ("phi_deg", "phi_deg"),
+    ("alpha_design_deg", "alpha_design_deg"),
+    ("beta_deg", "beta_deg"),
+    ("Re", "reynolds"),
+    ("Mach", "mach"),
+    ("Cl", "cl"),
+    ("Cd", "cd"),
+    ("Cl/Cd", "ld"),
+    ("objective_value", "objective_value"),
+    ("warning", "warning"),
+]
 DIAGNOSTIC_KEYS = [
     "requested_mode",
     "actual_mode",
