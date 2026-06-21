@@ -42,12 +42,23 @@ python propeller_lab/main.py
 
 ## Workspaces
 
-PropellerLab has two top-level workspaces:
+PropellerLab has three top-level workspaces:
 
 - Base Calculate: direct propeller analysis, geometry and polar import/export, RPM sweep, XFOIL polar generation, multi-Re XFOIL workflow, and auto Re range estimation.
 - Optimization Design: early propeller design workflow that generates a new twist distribution and can apply it back to Base Calculate.
+- Target Optimization: target-driven chord and twist optimization using random search, a genetic algorithm, or GA plus local refinement.
 
-The Workspace selector switches between these two workflows. Applying a generated design replaces the active custom geometry in Base Calculate and runs a new analysis.
+The Workspace selector switches between these workflows. Applying a generated design or optimized geometry replaces the active custom geometry in Base Calculate and runs a new analysis.
+
+## Local Data
+
+The project includes a local data library under `data/`:
+
+- `data/airfoils/`: airfoil coordinate DAT files, imported polar CSV files, and saved XFOIL polar files.
+- `data/blade_geometries/`: propeller blade geometry CSV files.
+- `data/designs/`: Optimization Design and Target Optimization geometry, history, and summary CSV exports.
+
+The folder structure is tracked by Git, but user data placed inside these subfolders is ignored by default.
 
 ## Testing
 
@@ -116,6 +127,47 @@ Available alpha objectives:
 
 Important limitation: local maximum Cl/Cd is not a complete global optimum propeller design. Full optimum propeller design would require chord optimization, induced-loss optimization, structural limits, noise limits, multi-point operating conditions, and validation with experiments or higher-fidelity tools.
 
+## Target Optimization workspace
+
+Target Optimization searches for a blade geometry that meets a requested operating objective. The optimizer changes chord/R and beta control points along the blade, interpolates them into the radial station geometry, analyzes each candidate with the existing propeller solver, and keeps the lowest-fitness result.
+
+The MVP uses fixed RPM for each optimization run. It uses active polar data from GenericPolar, imported TablePolar, XFOIL cached TablePolar, or MultiRePolar. XFOIL is not called during the optimization loop; use XFOIL beforehand only to generate polar tables.
+
+Available target modes:
+
+- Target thrust, minimize power.
+- Target thrust with torque limit.
+- Target torque, maximize thrust.
+- Match thrust.
+- Match torque.
+
+Available optimizer methods:
+
+- Random search.
+- Genetic algorithm.
+- Genetic algorithm with a compact local refinement pass.
+
+The workspace can copy Base Calculate inputs and use the current imported or XFOIL polar. If no imported or XFOIL polar is available, the optimizer falls back to GenericPolar and reports this in the optimization log. Results include a summary, generation history, best geometry table, convergence plot, geometry/load plot, and CSV exports for best geometry, optimization history, and optimization summary.
+
+This feature is a bounded engineering search, not a guaranteed global optimum. Review constraints such as maximum tip Mach, maximum angle of attack, stall fraction, low-Re fraction, and smoothness before accepting a design.
+
+Recommended workflow:
+
+1. Set up GenericPolar, import a polar CSV, or generate a single-Re or multi-Re XFOIL polar.
+2. Open Target Optimization and copy Base Calculate inputs if they are already set.
+3. Enter target thrust or torque, fixed RPM, V_inf, diameter, blade count, and geometry bounds.
+4. Run the optimizer and inspect fitness, target error, warnings, and geometry plots.
+5. Apply best geometry to Base Calculate.
+6. Verify the applied geometry with normal analysis, Auto Re range, and exports.
+
+Limitations:
+
+- Results depend on BEMT assumptions, polar quality, bounds, weights, and random seed.
+- Very broad bounds may produce unrealistic geometry.
+- The optimizer may find a local minimum rather than a global optimum.
+- Low Reynolds number, high angle of attack, high Mach, and post-stall operation need caution.
+- Validate important designs with experiments or higher-fidelity tools.
+
 ## Low-speed and static thrust handling
 
 Forward-flight phi-BEMT is not robust when V_inf is near zero. In that regime, the usual induction factor a = vi/V_inf becomes singular or ill-conditioned. PropellerLab uses a dimensional low-speed BEMT solver in static or near-static conditions. The low-speed solver directly solves axial induced velocity vi in m/s and does not divide by V_inf.
@@ -152,6 +204,5 @@ When Use multi-Re sweep is enabled, PropellerLab runs XFOIL at several represent
 
 - Motor and battery matching
 - Real propeller geometry import
-- Optimization
 - Report export
 - 3D geometry export

@@ -53,10 +53,20 @@ def test_find_alpha_max_ld_returns_finite_positive_drag():
 def test_fixed_alpha_objective_returns_requested_alpha():
     """Fixed alpha objective should use the requested alpha."""
 
-    design_input = DesignInput(rpm=8000.0, v_inf=5.0, rho=1.225, mu=1.81e-5, sound_speed=343.0, objective="fixed_alpha", fixed_alpha_deg=6.0)
+    design_input = DesignInput(
+        rpm=8000.0,
+        v_inf=5.0,
+        rho=1.225,
+        mu=1.81e-5,
+        sound_speed=343.0,
+        objective="fixed_alpha",
+        fixed_alpha_deg=20.0,
+        alpha_min_deg=-4.0,
+        alpha_max_deg=12.0,
+    )
     result = find_alpha_design(GenericPolar(), 100000.0, 0.05, math.radians(10.0), design_input)
 
-    assert math.isclose(float(result["alpha_deg"]), 6.0, rel_tol=1e-12)
+    assert math.isclose(float(result["alpha_deg"]), 20.0, rel_tol=1e-12)
 
 
 def test_target_thrust_mode_does_not_crash():
@@ -159,7 +169,7 @@ def test_multi_re_polar_works_with_design_mode():
 
 
 def test_main_window_workspace_smoke():
-    """MainWindow should expose both workspaces and legacy attributes."""
+    """MainWindow should expose workspaces and legacy attributes."""
 
     import os
 
@@ -171,9 +181,10 @@ def test_main_window_workspace_smoke():
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
 
-    assert window.workspace_combo.count() == 2
+    assert window.workspace_combo.count() == 3
     assert window.workspace_combo.itemText(0) == "Base Calculate"
     assert window.workspace_combo.itemText(1) == "Optimization Design"
+    assert window.workspace_combo.itemText(2) == "Target Optimization"
     window.workspace_combo.setCurrentIndex(1)
     assert window.workspace_stack.currentIndex() == 1
     for attr in (
@@ -186,6 +197,79 @@ def test_main_window_workspace_smoke():
         "auto_re_range_check",
     ):
         assert hasattr(window, attr)
+    app.processEvents()
+
+
+def test_main_window_design_controls_lock_irrelevant_parameters():
+    """Optimization Design controls should lock irrelevant inputs by mode."""
+
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from propeller_lab.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    assert not window.design_target_type_combo.isEnabled()
+    assert not window.design_target_value_spin.isEnabled()
+    assert not window.design_allow_beta_offset_check.isEnabled()
+    assert not window.design_fixed_alpha_spin.isEnabled()
+    assert window.design_alpha_min_spin.isEnabled()
+    assert window.design_stall_margin_spin.isEnabled()
+    assert window.design_max_cl_fraction_spin.isEnabled()
+
+    window.design_method_combo.setCurrentIndex(1)
+    assert window.design_target_type_combo.currentData() == "thrust"
+    assert not window.design_target_type_combo.isEnabled()
+    assert window.design_target_value_spin.isEnabled()
+    assert window.design_allow_beta_offset_check.isEnabled()
+
+    window.design_alpha_objective_combo.setCurrentIndex(1)
+    assert window.design_alpha_min_spin.isEnabled()
+    assert window.design_alpha_max_spin.isEnabled()
+    assert window.design_alpha_step_spin.isEnabled()
+    assert not window.design_stall_margin_spin.isEnabled()
+    assert not window.design_max_cl_fraction_spin.isEnabled()
+
+    window.design_alpha_objective_combo.setCurrentIndex(2)
+    assert window.design_fixed_alpha_spin.isEnabled()
+    assert not window.design_alpha_min_spin.isEnabled()
+    assert not window.design_alpha_max_spin.isEnabled()
+    assert not window.design_alpha_step_spin.isEnabled()
+    app.processEvents()
+
+
+def test_main_window_xfoil_source_controls_and_save_name(tmp_path):
+    """XFOIL source controls and default polar file name should follow the source."""
+
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from propeller_lab.ui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    window.xfoil_display_reynolds = 100000.0
+    assert window.naca_edit.isEnabled()
+    assert not window.dat_path_edit.isEnabled()
+    assert window._default_xfoil_polar_filename() == "naca4412_Re100000.csv"
+
+    dat_path = tmp_path / "Clark Y.dat"
+    dat_path.write_text("Clark Y\n", encoding="utf-8")
+    window.dat_path_edit.setText(str(dat_path))
+    window.airfoil_source_combo.setCurrentIndex(1)
+    window.xfoil_display_reynolds = 152345.6
+
+    assert not window.naca_edit.isEnabled()
+    assert window.dat_path_edit.isEnabled()
+    assert window.dat_browse_button.isEnabled()
+    assert window._default_xfoil_polar_filename() == "clark_y_Re152346.csv"
     app.processEvents()
 
 

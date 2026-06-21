@@ -187,7 +187,7 @@ def find_alpha_design(
     """Dispatch the alpha design objective."""
 
     if design_input.objective == "fixed_alpha":
-        alpha = clamp(design_input.fixed_alpha_deg, design_input.alpha_min_deg, design_input.alpha_max_deg)
+        alpha = clamp(design_input.fixed_alpha_deg, -90.0, 90.0)
         cl, cd, cm, warnings = polar.lookup(alpha, reynolds, mach)
         ld = safe_div(cl, cd)
         return {

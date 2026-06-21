@@ -13,7 +13,8 @@ from matplotlib.figure import Figure
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from propeller_lab.core.design import DesignStationResult
-from propeller_lab.core.models import StationResult
+from propeller_lab.core.models import GeometryStation, PropellerResult, StationResult
+from propeller_lab.core.optimizer import OptimizationHistoryRow
 from propeller_lab.core.xfoil_runner import XfoilPolarPoint
 
 
@@ -146,4 +147,70 @@ class DesignPlotWidget(_BasePlotWidget):
             ax.set_xlabel("r/R")
             ax.set_ylabel(ylabel)
             ax.grid(True)
+        self._redraw()
+
+
+class OptimizationHistoryPlotWidget(_BasePlotWidget):
+    """Plot target optimization convergence history."""
+
+    def update_plot(self, history: list[OptimizationHistoryRow]) -> None:
+        """Update fitness, target error, performance, and diagnostics."""
+
+        self.figure.clear()
+        axes = [self.figure.add_subplot(2, 2, i + 1) for i in range(4)]
+        generation = [row.generation for row in history]
+        series = [
+            ("Best fitness", [row.best_fitness for row in history], "fitness"),
+            ("Target error", [row.target_error_fraction for row in history], "fraction"),
+            ("Best loads", None, ""),
+            ("Constraints", None, ""),
+        ]
+        axes[0].plot(generation, series[0][1], label="fitness")
+        axes[1].plot(generation, series[1][1], label="target error")
+        axes[2].plot(generation, [row.best_thrust_N for row in history], label="T, N")
+        axes[2].plot(generation, [row.best_torque_Nm for row in history], label="Q, N*m")
+        axes[2].plot(generation, [row.best_power_W for row in history], label="P, W")
+        axes[3].plot(generation, [row.max_mach for row in history], label="max Mach")
+        axes[3].plot(generation, [row.stall_fraction for row in history], label="stall fraction")
+        axes[3].plot(generation, [row.low_re_fraction for row in history], label="low Re fraction")
+        for ax, (title, _values, ylabel) in zip(axes, series):
+            ax.set_title(title)
+            ax.set_xlabel("generation")
+            ax.set_ylabel(ylabel or title)
+            ax.grid(True)
+            ax.legend()
+        self._redraw()
+
+
+class OptimizedGeometryPlotWidget(_BasePlotWidget):
+    """Plot optimized blade geometry and optional radial loads."""
+
+    def update_plot(
+        self,
+        geometry: list[GeometryStation],
+        analysis: PropellerResult | None = None,
+    ) -> None:
+        """Update chord, beta, and optional load distributions."""
+
+        self.figure.clear()
+        axes = [self.figure.add_subplot(2, 2, i + 1) for i in range(4)]
+        r = [station.r_over_R for station in geometry]
+        axes[0].plot(r, [station.chord_over_R for station in geometry], label="chord/R")
+        axes[1].plot(r, [station.beta_deg for station in geometry], label="beta_deg")
+        if analysis is not None:
+            station_r = [station.r_over_R for station in analysis.stations]
+            axes[2].plot(station_r, [station.dT_dr for station in analysis.stations], label="dT/dr")
+            axes[3].plot(station_r, [station.alpha_deg for station in analysis.stations], label="alpha_deg")
+        axes[0].set_title("Chord distribution")
+        axes[0].set_ylabel("chord/R")
+        axes[1].set_title("Twist distribution")
+        axes[1].set_ylabel("deg")
+        axes[2].set_title("Radial thrust load")
+        axes[2].set_ylabel("dT/dr")
+        axes[3].set_title("Angle of attack")
+        axes[3].set_ylabel("deg")
+        for ax in axes:
+            ax.set_xlabel("r/R")
+            ax.grid(True)
+            ax.legend()
         self._redraw()

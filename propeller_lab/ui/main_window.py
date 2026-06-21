@@ -38,7 +38,14 @@ from PySide6.QtWidgets import (
 
 from propeller_lab.core.bemt import calculate_propeller
 from propeller_lab.core.design import DesignInput, DesignResult, clone_geometry, design_twist_with_target
-from propeller_lab.core.export import export_design_station_csv, export_scan_csv, export_station_csv, export_summary_csv
+from propeller_lab.core.export import (
+    export_design_station_csv,
+    export_optimization_history_csv,
+    export_optimization_summary_csv,
+    export_scan_csv,
+    export_station_csv,
+    export_summary_csv,
+)
 from propeller_lab.core.geometry import (
     estimate_reynolds_range,
     generate_pitch_geometry,
@@ -49,10 +56,25 @@ from propeller_lab.core.geometry import (
     save_geometry_csv,
 )
 from propeller_lab.core.models import GeometryStation, PolarPoint, PropellerInput, PropellerResult
+from propeller_lab.core.optimizer import (
+    CandidateEvaluation,
+    OptimizationHistoryRow,
+    TargetOptimizationInput,
+    TargetOptimizationResult,
+)
 from propeller_lab.core.polar import AirfoilPolar, MultiRePolar, TablePolar
 from propeller_lab.core.xfoil_runner import XfoilPolarPoint, XfoilRunResult, XfoilRunner
 from propeller_lab.ui.app_state import AppState
-from propeller_lab.ui.plot_widgets import AeroPlotWidget, DesignPlotWidget, LoadPlotWidget, PolarPlotWidget, ScanPlotWidget
+from propeller_lab.ui.optimization_worker import OptimizationWorker
+from propeller_lab.ui.plot_widgets import (
+    AeroPlotWidget,
+    DesignPlotWidget,
+    LoadPlotWidget,
+    OptimizedGeometryPlotWidget,
+    OptimizationHistoryPlotWidget,
+    PolarPlotWidget,
+    ScanPlotWidget,
+)
 from propeller_lab.ui.xfoil_worker import XfoilWorker
 
 
@@ -70,9 +92,13 @@ class MainWindow(QMainWindow):
         self.current_polar = None
         self.xfoil_points: list[XfoilPolarPoint] = []
         self.xfoil_reynolds_tables: dict[float, list[XfoilPolarPoint]] = {}
+        self.xfoil_display_reynolds: float | None = None
         self.scan_rows: list[dict[str, float | int]] = []
         self.xfoil_thread: QThread | None = None
         self.xfoil_worker: XfoilWorker | None = None
+        self.optimization_thread: QThread | None = None
+        self.optimization_worker: OptimizationWorker | None = None
+        self.target_progress_history: list[OptimizationHistoryRow] = []
         self._pitch_syncing = False
 
         central = QWidget()
@@ -83,6 +109,7 @@ class MainWindow(QMainWindow):
         self.workspace_combo = QComboBox()
         self.workspace_combo.addItem("Base Calculate")
         self.workspace_combo.addItem("Optimization Design")
+        self.workspace_combo.addItem("Target Optimization")
         top_bar.addWidget(self.workspace_combo)
         top_bar.addStretch(1)
         central_layout.addLayout(top_bar)
@@ -94,9 +121,11 @@ class MainWindow(QMainWindow):
         splitter.setSizes([360, 920])
         self.workspace_stack.addWidget(splitter)
         self.workspace_stack.addWidget(self._build_design_workspace())
+        self.workspace_stack.addWidget(self._build_target_optimization_workspace())
         central_layout.addWidget(self.workspace_stack, 1)
         self.workspace_combo.currentIndexChanged.connect(self.workspace_stack.setCurrentIndex)
         self.setCentralWidget(central)
+        self._update_design_control_state()
         self._connect_re_range_inputs()
         self._update_re_range_from_inputs(log=False, show_errors=False)
 
@@ -361,7 +390,7 @@ class MainWindow(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         top = QGridLayout()
-        self.xfoil_path_edit = QLineEdit("xfoil")
+        self.xfoil_path_edit = QLineEdit(_default_xfoil_path())
         self.xfoil_browse_button = QPushButton("Browse")
         self.xfoil_check_button = QPushButton("Check XFOIL")
         self.airfoil_source_combo = QComboBox()
@@ -440,9 +469,11 @@ class MainWindow(QMainWindow):
         self.xfoil_check_button.clicked.connect(self.check_xfoil)
         self.estimate_re_button.clicked.connect(self.estimate_re_range)
         self.auto_re_range_check.toggled.connect(self._auto_estimate_re_range)
+        self.airfoil_source_combo.currentIndexChanged.connect(self._update_airfoil_source_controls)
         self.run_xfoil_button.clicked.connect(self.run_xfoil)
         self.save_xfoil_button.clicked.connect(self.save_xfoil_csv)
         self.use_xfoil_button.clicked.connect(self.use_xfoil_polar)
+        self._update_airfoil_source_controls()
         return widget
 
     def _build_design_workspace(self) -> QWidget:
@@ -489,6 +520,7 @@ class MainWindow(QMainWindow):
         layout.addRow("Target type", self.design_target_type_combo)
         layout.addRow("Target value", self.design_target_value_spin)
         self.design_method_combo.currentIndexChanged.connect(self._sync_design_method_target)
+        self.design_target_type_combo.currentIndexChanged.connect(self._update_design_control_state)
         return group
 
     def _design_objective_group(self) -> QGroupBox:
@@ -513,6 +545,7 @@ class MainWindow(QMainWindow):
         layout.addRow("Alpha step, deg", self.design_alpha_step_spin)
         layout.addRow("Stall margin, deg", self.design_stall_margin_spin)
         layout.addRow("Max Cl fraction", self.design_max_cl_fraction_spin)
+        self.design_alpha_objective_combo.currentIndexChanged.connect(self._update_design_control_state)
         return group
 
     def _design_constraints_group(self) -> QGroupBox:
@@ -600,6 +633,231 @@ class MainWindow(QMainWindow):
         self.design_station_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.design_station_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.design_station_table)
+        return widget
+
+    def _build_target_optimization_workspace(self) -> QWidget:
+        """Build the Target Optimization workspace."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.addWidget(self._target_conditions_group())
+        controls_layout.addWidget(self._target_bounds_group())
+        controls_layout.addWidget(self._target_algorithm_group())
+        controls_layout.addWidget(self._target_button_group())
+        controls_layout.addStretch(1)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setWidget(controls)
+        splitter.addWidget(controls_scroll)
+        splitter.addWidget(self._target_output_tabs())
+        splitter.setSizes([420, 860])
+        layout.addWidget(splitter)
+        self._sync_target_from_base()
+        self._update_target_mode_controls()
+        return widget
+
+    def _target_conditions_group(self) -> QGroupBox:
+        """Build target and operating condition controls."""
+
+        group = QGroupBox("Target and operating point")
+        layout = QFormLayout(group)
+        self.target_mode_combo = QComboBox()
+        self.target_mode_combo.addItem("Target thrust, minimize power", "target_thrust_min_power")
+        self.target_mode_combo.addItem("Target thrust with torque limit", "target_thrust_torque_limited")
+        self.target_mode_combo.addItem("Target torque, maximize thrust", "target_torque_max_thrust")
+        self.target_mode_combo.addItem("Match thrust", "match_thrust")
+        self.target_mode_combo.addItem("Match torque", "match_torque")
+        self.target_thrust_spin = _spin_float(0.0, 1000000.0, 1.0, 4, 0.1)
+        self.target_torque_spin = _spin_float(0.0, 1000000.0, 0.05, 5, 0.01)
+        self.target_torque_limit_spin = _spin_float(0.0, 1000000.0, 0.08, 5, 0.01)
+        self.target_power_limit_spin = _spin_float(0.0, 100000000.0, 0.0, 3, 1.0)
+        self.target_blades_spin = _spin_int(1, 12, 2)
+        self.target_diameter_spin = _spin_float(0.001, 10.0, 0.254, 4, 0.001)
+        self.target_hub_spin = _spin_float(0.0, 9.0, 0.035, 4, 0.001)
+        self.target_rpm_spin = _spin_float(0.0, 200000.0, 8000.0, 1, 100.0)
+        self.target_vinf_spin = _spin_float(0.0, 400.0, 0.0, 3, 0.1)
+        self.target_rho_spin = _spin_float(0.001, 50.0, 1.225, 4, 0.001)
+        self.target_mu_spin = _spin_float(0.00000001, 0.1, 1.81e-5, 8, 0.000001)
+        self.target_sound_speed_spin = _spin_float(1.0, 2000.0, 343.0, 3, 1.0)
+        self.target_elements_spin = _spin_int(3, 500, 40)
+        self.sync_target_base_button = QPushButton("Use Base Calculate inputs")
+        self.target_polar_label = QLabel("Polar: Generic airfoil")
+        self.target_polar_label.setWordWrap(True)
+        self.use_target_polar_button = QPushButton("Use current Base polar")
+
+        layout.addRow("Target mode", self.target_mode_combo)
+        layout.addRow("Target thrust, N", self.target_thrust_spin)
+        layout.addRow("Target torque, N*m", self.target_torque_spin)
+        layout.addRow("Torque limit, N*m", self.target_torque_limit_spin)
+        layout.addRow("Power limit, W", self.target_power_limit_spin)
+        layout.addRow("Blades B", self.target_blades_spin)
+        layout.addRow("Diameter D, m", self.target_diameter_spin)
+        layout.addRow("Hub diameter, m", self.target_hub_spin)
+        layout.addRow("RPM", self.target_rpm_spin)
+        layout.addRow("V_inf, m/s", self.target_vinf_spin)
+        layout.addRow("Density rho", self.target_rho_spin)
+        layout.addRow("Dynamic viscosity mu", self.target_mu_spin)
+        layout.addRow("Sound speed a", self.target_sound_speed_spin)
+        layout.addRow("Elements", self.target_elements_spin)
+        layout.addRow(self.target_polar_label)
+        layout.addRow(self.sync_target_base_button, self.use_target_polar_button)
+
+        self.target_mode_combo.currentIndexChanged.connect(self._update_target_mode_controls)
+        self.sync_target_base_button.clicked.connect(self._sync_target_from_base)
+        self.use_target_polar_button.clicked.connect(self._refresh_target_polar_label)
+        return group
+
+    def _target_bounds_group(self) -> QGroupBox:
+        """Build target optimization geometry and diagnostic bounds."""
+
+        group = QGroupBox("Geometry bounds and diagnostics")
+        layout = QFormLayout(group)
+        self.target_control_points_spin = _spin_int(2, 20, 6)
+        self.target_chord_min_spin = _spin_float(0.001, 1.0, 0.03, 4, 0.001)
+        self.target_chord_max_spin = _spin_float(0.001, 1.0, 0.18, 4, 0.001)
+        self.target_beta_min_spin = _spin_float(-20.0, 90.0, 2.0, 2, 0.5)
+        self.target_beta_max_spin = _spin_float(-20.0, 90.0, 45.0, 2, 0.5)
+        self.target_max_tip_mach_spin = _spin_float(0.1, 2.0, 0.75, 3, 0.05)
+        self.target_max_alpha_spin = _spin_float(0.1, 90.0, 18.0, 2, 0.5)
+        self.target_max_stall_fraction_spin = _spin_float(0.0, 1.0, 0.35, 3, 0.05)
+        self.target_max_low_re_fraction_spin = _spin_float(0.0, 1.0, 0.50, 3, 0.05)
+        layout.addRow("Control points", self.target_control_points_spin)
+        layout.addRow("Chord min c/R", self.target_chord_min_spin)
+        layout.addRow("Chord max c/R", self.target_chord_max_spin)
+        layout.addRow("Beta min, deg", self.target_beta_min_spin)
+        layout.addRow("Beta max, deg", self.target_beta_max_spin)
+        layout.addRow("Max tip Mach", self.target_max_tip_mach_spin)
+        layout.addRow("Max alpha, deg", self.target_max_alpha_spin)
+        layout.addRow("Max stall fraction", self.target_max_stall_fraction_spin)
+        layout.addRow("Max low Re fraction", self.target_max_low_re_fraction_spin)
+        return group
+
+    def _target_algorithm_group(self) -> QGroupBox:
+        """Build target optimization algorithm controls."""
+
+        group = QGroupBox("Optimizer")
+        layout = QFormLayout(group)
+        self.target_method_combo = QComboBox()
+        self.target_method_combo.addItem("Genetic algorithm", "genetic_algorithm")
+        self.target_method_combo.addItem("Random search", "random_search")
+        self.target_method_combo.addItem("GA + local refine", "ga_local_refine")
+        self.target_population_spin = _spin_int(2, 500, 40)
+        self.target_generations_spin = _spin_int(1, 500, 40)
+        self.target_mutation_spin = _spin_float(0.0, 1.0, 0.15, 3, 0.01)
+        self.target_crossover_spin = _spin_float(0.0, 1.0, 0.75, 3, 0.01)
+        self.target_elitism_spin = _spin_int(0, 50, 2)
+        self.target_tournament_spin = _spin_int(1, 20, 3)
+        self.target_seed_spin = _spin_int(0, 1000000000, 1)
+        self.target_smoothness_weight_spin = _spin_float(0.0, 100.0, 0.05, 4, 0.01)
+        self.target_power_weight_spin = _spin_float(0.0, 100.0, 0.10, 4, 0.01)
+        self.target_torque_weight_spin = _spin_float(0.0, 100.0, 2.0, 4, 0.1)
+        self.target_constraint_weight_spin = _spin_float(0.0, 100.0, 5.0, 4, 0.1)
+        layout.addRow("Method", self.target_method_combo)
+        layout.addRow("Population size", self.target_population_spin)
+        layout.addRow("Generations", self.target_generations_spin)
+        layout.addRow("Mutation rate", self.target_mutation_spin)
+        layout.addRow("Crossover rate", self.target_crossover_spin)
+        layout.addRow("Elitism count", self.target_elitism_spin)
+        layout.addRow("Tournament size", self.target_tournament_spin)
+        layout.addRow("Random seed", self.target_seed_spin)
+        layout.addRow("Smoothness weight", self.target_smoothness_weight_spin)
+        layout.addRow("Power weight", self.target_power_weight_spin)
+        layout.addRow("Torque weight", self.target_torque_weight_spin)
+        layout.addRow("Constraint weight", self.target_constraint_weight_spin)
+        return group
+
+    def _target_button_group(self) -> QGroupBox:
+        """Build target optimization action buttons."""
+
+        group = QGroupBox("Actions")
+        layout = QGridLayout(group)
+        self.start_target_button = QPushButton("Start optimization")
+        self.stop_target_button = QPushButton("Stop")
+        self.apply_target_button = QPushButton("Apply best to Base Calculate")
+        self.export_target_geometry_button = QPushButton("Export best geometry CSV")
+        self.export_target_history_button = QPushButton("Export history CSV")
+        self.export_target_summary_button = QPushButton("Export summary CSV")
+        buttons = [
+            self.start_target_button,
+            self.stop_target_button,
+            self.apply_target_button,
+            self.export_target_geometry_button,
+            self.export_target_history_button,
+            self.export_target_summary_button,
+        ]
+        for idx, button in enumerate(buttons):
+            layout.addWidget(button, idx // 2, idx % 2)
+        self.stop_target_button.setEnabled(False)
+        self.apply_target_button.setEnabled(False)
+        self.export_target_geometry_button.setEnabled(False)
+        self.export_target_history_button.setEnabled(False)
+        self.export_target_summary_button.setEnabled(False)
+        self.start_target_button.clicked.connect(self.start_target_optimization)
+        self.stop_target_button.clicked.connect(self.stop_target_optimization)
+        self.apply_target_button.clicked.connect(self.apply_target_optimization_to_base)
+        self.export_target_geometry_button.clicked.connect(self.export_target_geometry)
+        self.export_target_history_button.clicked.connect(self.export_target_history)
+        self.export_target_summary_button.clicked.connect(self.export_target_summary)
+        return group
+
+    def _target_output_tabs(self) -> QTabWidget:
+        """Build target optimization output tabs."""
+
+        tabs = QTabWidget()
+        tabs.addTab(self._target_summary_tab(), "Optimization summary")
+        tabs.addTab(self._target_history_table_tab(), "History")
+        tabs.addTab(self._target_geometry_table_tab(), "Best geometry")
+        self.target_history_plot = OptimizationHistoryPlotWidget()
+        tabs.addTab(self.target_history_plot, "Convergence")
+        self.target_geometry_plot = OptimizedGeometryPlotWidget()
+        tabs.addTab(self.target_geometry_plot, "Geometry plots")
+        return tabs
+
+    def _target_summary_tab(self) -> QWidget:
+        """Build target optimization summary tab."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        form = QFormLayout()
+        self.target_summary_labels: dict[str, QLabel] = {}
+        for key, label in TARGET_SUMMARY_ROWS:
+            value_label = QLabel("-")
+            self.target_summary_labels[key] = value_label
+            form.addRow(label, value_label)
+        layout.addLayout(form)
+        self.target_warning_text = QTextEdit()
+        self.target_warning_text.setReadOnly(True)
+        self.target_warning_text.setPlaceholderText("Optimization log and warnings")
+        layout.addWidget(self.target_warning_text, 1)
+        return widget
+
+    def _target_history_table_tab(self) -> QWidget:
+        """Build target optimization history table tab."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self.target_history_table = QTableWidget(0, len(TARGET_HISTORY_COLUMNS))
+        self.target_history_table.setHorizontalHeaderLabels([label for label, _attr in TARGET_HISTORY_COLUMNS])
+        self.target_history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.target_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.target_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.target_history_table)
+        return widget
+
+    def _target_geometry_table_tab(self) -> QWidget:
+        """Build target optimization best geometry table tab."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self.target_geometry_table = QTableWidget(0, len(TARGET_GEOMETRY_COLUMNS))
+        self.target_geometry_table.setHorizontalHeaderLabels([label for label, _attr in TARGET_GEOMETRY_COLUMNS])
+        self.target_geometry_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.target_geometry_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.target_geometry_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.target_geometry_table)
         return widget
 
     def _input(self) -> PropellerInput:
@@ -733,6 +991,382 @@ class MainWindow(QMainWindow):
         index = self.design_target_type_combo.findData(target_type)
         if index >= 0:
             self.design_target_type_combo.setCurrentIndex(index)
+        self._update_design_control_state()
+
+    def _update_design_control_state(self, *_args: object) -> None:
+        """Enable only controls relevant to the current design choices."""
+
+        target_type = str(self.design_target_type_combo.currentData())
+        has_target = target_type in ("thrust", "power")
+        self.design_target_type_combo.setEnabled(False)
+        self.design_target_value_spin.setEnabled(has_target)
+        self.design_allow_beta_offset_check.setEnabled(has_target)
+        if not has_target:
+            self.design_allow_beta_offset_check.setChecked(False)
+        elif not self.design_allow_beta_offset_check.isChecked():
+            self.design_allow_beta_offset_check.setChecked(True)
+
+        objective = str(self.design_alpha_objective_combo.currentData())
+        is_fixed_alpha = objective == "fixed_alpha"
+        is_max_ld = objective == "max_ld"
+        uses_scan = not is_fixed_alpha
+        self.design_fixed_alpha_spin.setEnabled(is_fixed_alpha)
+        self.design_alpha_min_spin.setEnabled(uses_scan)
+        self.design_alpha_max_spin.setEnabled(uses_scan)
+        self.design_alpha_step_spin.setEnabled(uses_scan)
+        self.design_stall_margin_spin.setEnabled(is_max_ld)
+        self.design_max_cl_fraction_spin.setEnabled(is_max_ld)
+
+    def _sync_target_from_base(self) -> None:
+        """Copy Base Calculate inputs into the target optimization workspace."""
+
+        pairs: list[tuple[QDoubleSpinBox | QSpinBox, float]] = [
+            (self.target_blades_spin, self.blades_spin.value()),
+            (self.target_diameter_spin, self.diameter_spin.value()),
+            (self.target_hub_spin, self.hub_spin.value()),
+            (self.target_rpm_spin, self.rpm_spin.value()),
+            (self.target_vinf_spin, self.vinf_spin.value()),
+            (self.target_rho_spin, self.rho_spin.value()),
+            (self.target_mu_spin, self.mu_spin.value()),
+            (self.target_sound_speed_spin, self.sound_speed_spin.value()),
+            (self.target_elements_spin, self.elements_spin.value()),
+        ]
+        for spin, value in pairs:
+            _set_spin_value_silently(spin, value)
+        chord_min = max(min(self.root_chord_spin.value(), self.tip_chord_spin.value()) * 0.5, 0.001)
+        chord_max = min(max(self.root_chord_spin.value(), self.tip_chord_spin.value()) * 1.5, 1.0)
+        if chord_min < chord_max:
+            _set_spin_value_silently(self.target_chord_min_spin, chord_min)
+            _set_spin_value_silently(self.target_chord_max_spin, chord_max)
+        if self.current_result is not None:
+            _set_spin_value_silently(self.target_thrust_spin, max(self.current_result.thrust_N, 0.0))
+            _set_spin_value_silently(self.target_torque_spin, max(self.current_result.torque_Nm, 0.0))
+            _set_spin_value_silently(self.target_torque_limit_spin, max(self.current_result.torque_Nm * 1.1, 0.0))
+            _set_spin_value_silently(self.target_power_limit_spin, max(self.current_result.power_W * 1.25, 0.0))
+        self._refresh_target_polar_label()
+
+    def _refresh_target_polar_label(self) -> None:
+        """Refresh the target optimization polar status label."""
+
+        mode = str(self.polar_mode_combo.currentData())
+        if mode == "generic":
+            text = "Polar: Generic airfoil"
+        elif self.current_polar is None:
+            text = "Polar: missing; optimizer will use Generic airfoil"
+        elif isinstance(self.current_polar, MultiRePolar):
+            text = "Polar: current Multi-Re table"
+        elif isinstance(self.current_polar, TablePolar):
+            text = f"Polar: current table with {len(self.current_polar.points)} point(s)"
+        else:
+            text = "Polar: current imported polar"
+        self.target_polar_label.setText(text)
+
+    def _update_target_mode_controls(self, *_args: object) -> None:
+        """Enable only target fields relevant to the selected objective."""
+
+        mode = str(self.target_mode_combo.currentData())
+        uses_thrust = mode in ("target_thrust_min_power", "target_thrust_torque_limited", "match_thrust")
+        uses_torque = mode in ("target_torque_max_thrust", "match_torque")
+        uses_torque_limit = mode in ("target_thrust_torque_limited", "target_torque_max_thrust")
+        self.target_thrust_spin.setEnabled(uses_thrust)
+        self.target_torque_spin.setEnabled(uses_torque)
+        self.target_torque_limit_spin.setEnabled(uses_torque_limit)
+
+    def _target_optimization_input(self) -> TargetOptimizationInput:
+        """Read TargetOptimizationInput from controls."""
+
+        if self.target_diameter_spin.value() <= self.target_hub_spin.value():
+            raise ValueError("Diameter must be greater than hub diameter.")
+        if self.target_chord_min_spin.value() >= self.target_chord_max_spin.value():
+            raise ValueError("Chord min must be smaller than chord max.")
+        if self.target_beta_min_spin.value() >= self.target_beta_max_spin.value():
+            raise ValueError("Beta min must be smaller than beta max.")
+        constraint_weight = self.target_constraint_weight_spin.value()
+        seed_value = self.target_seed_spin.value()
+        return TargetOptimizationInput(
+            target_mode=str(self.target_mode_combo.currentData()),
+            target_thrust_N=self.target_thrust_spin.value(),
+            target_torque_Nm=self.target_torque_spin.value(),
+            torque_limit_Nm=self.target_torque_limit_spin.value(),
+            power_limit_W=self.target_power_limit_spin.value(),
+            blades=self.target_blades_spin.value(),
+            diameter_m=self.target_diameter_spin.value(),
+            hub_diameter_m=self.target_hub_spin.value(),
+            rpm=self.target_rpm_spin.value(),
+            v_inf=self.target_vinf_spin.value(),
+            rho=self.target_rho_spin.value(),
+            mu=self.target_mu_spin.value(),
+            sound_speed=self.target_sound_speed_spin.value(),
+            elements=self.target_elements_spin.value(),
+            control_points=self.target_control_points_spin.value(),
+            chord_min_ratio=self.target_chord_min_spin.value(),
+            chord_max_ratio=self.target_chord_max_spin.value(),
+            beta_min_deg=self.target_beta_min_spin.value(),
+            beta_max_deg=self.target_beta_max_spin.value(),
+            max_tip_mach=self.target_max_tip_mach_spin.value(),
+            max_alpha_deg=self.target_max_alpha_spin.value(),
+            max_stall_fraction=self.target_max_stall_fraction_spin.value(),
+            max_low_re_fraction=self.target_max_low_re_fraction_spin.value(),
+            optimizer_method=str(self.target_method_combo.currentData()),
+            population_size=self.target_population_spin.value(),
+            generations=self.target_generations_spin.value(),
+            mutation_rate=self.target_mutation_spin.value(),
+            crossover_rate=self.target_crossover_spin.value(),
+            elitism_count=self.target_elitism_spin.value(),
+            tournament_size=self.target_tournament_spin.value(),
+            random_seed=None if seed_value == 0 else seed_value,
+            smoothness_weight=self.target_smoothness_weight_spin.value(),
+            power_weight=self.target_power_weight_spin.value(),
+            torque_weight=self.target_torque_weight_spin.value(),
+            mach_weight=constraint_weight,
+            stall_weight=constraint_weight,
+            low_re_weight=0.1 * constraint_weight,
+            geometry_weight=0.1 * constraint_weight,
+        )
+
+    def _target_optimization_polar(self) -> AirfoilPolar | None:
+        """Return the polar for target optimization, falling back to GenericPolar."""
+
+        mode = str(self.polar_mode_combo.currentData())
+        if mode == "generic":
+            return None
+        if self.current_polar is None:
+            self._append_target_log("No imported or XFOIL polar is available; using Generic airfoil.")
+            return None
+        return self.current_polar
+
+    def start_target_optimization(self) -> None:
+        """Start target optimization in a worker thread."""
+
+        if self.optimization_thread is not None:
+            QMessageBox.information(self, "Target optimization", "Target optimization is already running.")
+            return
+        try:
+            opt_input = self._target_optimization_input()
+            self.target_warning_text.clear()
+            polar = self._target_optimization_polar()
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Target optimization setup failed", str(exc))
+            return
+        self._append_target_log("Starting target optimization.")
+        self._append_target_log("Model-based optimizer only; not CFD, structural, noise, or guaranteed global optimum.")
+        self.target_progress_history = []
+        self._fill_target_history_table([])
+        self._fill_target_geometry_table([])
+        self.start_target_button.setEnabled(False)
+        self.stop_target_button.setEnabled(True)
+        self.optimization_thread = QThread(self)
+        self.optimization_worker = OptimizationWorker(
+            opt_input,
+            polar,
+            clone_geometry(self.current_geometry) if self.current_geometry is not None else None,
+        )
+        self.optimization_worker.moveToThread(self.optimization_thread)
+        self.optimization_thread.started.connect(self.optimization_worker.run)
+        self.optimization_worker.log.connect(self._append_target_log)
+        self.optimization_worker.progress.connect(self._target_optimization_progress)
+        self.optimization_worker.finished.connect(self._target_optimization_finished)
+        self.optimization_worker.failed.connect(self._target_optimization_failed)
+        self.optimization_worker.finished.connect(self.optimization_thread.quit)
+        self.optimization_worker.failed.connect(self.optimization_thread.quit)
+        self.optimization_thread.finished.connect(self._target_optimization_cleanup)
+        self.optimization_thread.start()
+
+    def stop_target_optimization(self) -> None:
+        """Request target optimization stop."""
+
+        if self.optimization_worker is not None:
+            self.optimization_worker.request_stop()
+        self.stop_target_button.setEnabled(False)
+
+    def _target_optimization_progress(self, generation: int, total: int, best: object) -> None:
+        """Update target optimization progress summary."""
+
+        self.target_summary_labels["progress"].setText(f"{generation}/{total}")
+        if isinstance(best, CandidateEvaluation):
+            self.target_summary_labels["best_fitness"].setText(_fmt(best.fitness))
+            self.target_summary_labels["target_error"].setText(_fmt(best.target_error_fraction))
+            if best.analysis is not None:
+                self.target_summary_labels["T"].setText(_fmt(best.analysis.thrust_N))
+                self.target_summary_labels["Q"].setText(_fmt(best.analysis.torque_Nm))
+                self.target_summary_labels["P"].setText(_fmt(best.analysis.power_W))
+                row = OptimizationHistoryRow(
+                    generation=max(generation - 1, 0),
+                    evaluations=generation * self.target_population_spin.value(),
+                    best_fitness=best.fitness,
+                    best_thrust_N=best.analysis.thrust_N,
+                    best_torque_Nm=best.analysis.torque_Nm,
+                    best_power_W=best.analysis.power_W,
+                    best_eta=best.analysis.eta,
+                    best_ct=best.analysis.ct,
+                    best_cq=best.analysis.cq,
+                    best_cp=best.analysis.cp,
+                    target_error_fraction=best.target_error_fraction,
+                    stall_fraction=float(best.diagnostics.get("stall_fraction", 0.0)),
+                    low_re_fraction=float(best.diagnostics.get("low_re_fraction", 0.0)),
+                    max_mach=float(best.diagnostics.get("max_mach", 0.0)),
+                )
+                self.target_progress_history.append(row)
+                self._fill_target_history_table(self.target_progress_history)
+                self._fill_target_geometry_table(best.geometry)
+                self.target_history_plot.update_plot(self.target_progress_history)
+                self.target_geometry_plot.update_plot(best.geometry, best.analysis)
+
+    def _target_optimization_finished(self, result: TargetOptimizationResult) -> None:
+        """Handle completed target optimization."""
+
+        self.app_state.last_target_optimization_result = result
+        self._show_target_optimization_result(result)
+        self.apply_target_button.setEnabled(True)
+        self.export_target_geometry_button.setEnabled(True)
+        self.export_target_history_button.setEnabled(True)
+        self.export_target_summary_button.setEnabled(True)
+        self._append_target_log("Target optimization result is ready.")
+
+    def _target_optimization_failed(self, message: str) -> None:
+        """Handle failed target optimization."""
+
+        self._append_target_log(f"Target optimization failed: {message}")
+        QMessageBox.warning(self, "Target optimization failed", message)
+
+    def _target_optimization_cleanup(self) -> None:
+        """Release target optimization worker references."""
+
+        self.start_target_button.setEnabled(True)
+        self.stop_target_button.setEnabled(False)
+        if self.optimization_worker is not None:
+            self.optimization_worker.deleteLater()
+        if self.optimization_thread is not None:
+            self.optimization_thread.deleteLater()
+        self.optimization_worker = None
+        self.optimization_thread = None
+
+    def apply_target_optimization_to_base(self) -> None:
+        """Apply the optimized geometry and operating point to Base Calculate."""
+
+        result = self.app_state.last_target_optimization_result
+        if result is None:
+            QMessageBox.information(self, "No target optimization", "Please run target optimization first.")
+            return
+        opt_input = result.input
+        self.current_geometry = clone_geometry(result.best_geometry)
+        _set_spin_value_silently(self.blades_spin, opt_input.blades)
+        _set_spin_value_silently(self.diameter_spin, opt_input.diameter_m)
+        _set_spin_value_silently(self.hub_spin, opt_input.hub_diameter_m)
+        _set_spin_value_silently(self.rpm_spin, opt_input.rpm)
+        _set_spin_value_silently(self.vinf_spin, opt_input.v_inf)
+        _set_spin_value_silently(self.rho_spin, opt_input.rho)
+        _set_spin_value_silently(self.mu_spin, opt_input.mu)
+        _set_spin_value_silently(self.sound_speed_spin, opt_input.sound_speed)
+        _set_spin_value_silently(self.elements_spin, len(result.best_geometry))
+        if self.current_polar is None:
+            self.polar_mode_combo.setCurrentIndex(0)
+        self._auto_estimate_re_range()
+        self.workspace_combo.setCurrentIndex(0)
+        self.calculate()
+
+    def export_target_geometry(self) -> None:
+        """Export the best target optimization geometry."""
+
+        result = self.app_state.last_target_optimization_result
+        if result is None:
+            QMessageBox.information(self, "No target optimization", "Please run target optimization first.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(self, "Export optimized geometry CSV", "optimized_geometry.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            save_geometry_csv(result.best_geometry, path)
+            QMessageBox.information(self, "Geometry exported", "Optimized geometry CSV was written.")
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Optimized geometry export failed", str(exc))
+
+    def export_target_history(self) -> None:
+        """Export target optimization history."""
+
+        result = self.app_state.last_target_optimization_result
+        if result is None:
+            QMessageBox.information(self, "No target optimization", "Please run target optimization first.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(self, "Export optimization history CSV", "optimization_history.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            export_optimization_history_csv(result, path)
+            QMessageBox.information(self, "History exported", "Optimization history CSV was written.")
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Optimization history export failed", str(exc))
+
+    def export_target_summary(self) -> None:
+        """Export target optimization summary."""
+
+        result = self.app_state.last_target_optimization_result
+        if result is None:
+            QMessageBox.information(self, "No target optimization", "Please run target optimization first.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(self, "Export optimization summary CSV", "optimization_summary.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            export_optimization_summary_csv(result, path)
+            QMessageBox.information(self, "Summary exported", "Optimization summary CSV was written.")
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Optimization summary export failed", str(exc))
+
+    def _show_target_optimization_result(self, result: TargetOptimizationResult) -> None:
+        """Refresh target optimization summary, tables, and plots."""
+
+        analysis = result.best_analysis
+        values: dict[str, object] = {
+            "progress": f"{len(result.history)}/{result.input.generations}",
+            "T": analysis.thrust_N,
+            "Q": analysis.torque_Nm,
+            "P": analysis.power_W,
+            "eta": analysis.eta,
+            "CT": analysis.ct,
+            "CQ": analysis.cq,
+            "CP": analysis.cp,
+            "best_fitness": result.best_fitness,
+            "target_error": result.target_error_fraction,
+            "evaluations": result.evaluations,
+            "target_mode": result.input.target_mode,
+            "optimizer_method": result.input.optimizer_method,
+        }
+        for key, label in self.target_summary_labels.items():
+            label.setText(_fmt(values.get(key, result.diagnostics.get(key, "-"))))
+        warning_lines = ["Model-based optimizer only; not CFD, structural, noise, or guaranteed global optimum."]
+        warning_lines.extend(result.warnings)
+        if result.diagnostics:
+            warning_lines.append("")
+            warning_lines.extend(f"{key}: {value}" for key, value in result.diagnostics.items())
+        self.target_warning_text.setPlainText("\n".join(warning_lines))
+        self._fill_target_history_table(result.history)
+        self._fill_target_geometry_table(result.best_geometry)
+        self.target_history_plot.update_plot(result.history)
+        self.target_geometry_plot.update_plot(result.best_geometry, result.best_analysis)
+
+    def _fill_target_history_table(self, rows: list[Any]) -> None:
+        """Populate the target optimization history table."""
+
+        self.target_history_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for col, (_label, attr) in enumerate(TARGET_HISTORY_COLUMNS):
+                value = getattr(row, attr)
+                self.target_history_table.setItem(row_index, col, QTableWidgetItem(_fmt(value) if isinstance(value, float) else str(value)))
+
+    def _fill_target_geometry_table(self, geometry: list[GeometryStation]) -> None:
+        """Populate the target optimization best geometry table."""
+
+        self.target_geometry_table.setRowCount(len(geometry))
+        for row_index, station in enumerate(geometry):
+            for col, (_label, attr) in enumerate(TARGET_GEOMETRY_COLUMNS):
+                value = getattr(station, attr)
+                self.target_geometry_table.setItem(row_index, col, QTableWidgetItem(_fmt(value) if isinstance(value, float) else str(value)))
+
+    def _append_target_log(self, message: str) -> None:
+        """Append one line to the target optimization log."""
+
+        self.target_warning_text.append(message)
 
     def generate_design(self) -> None:
         """Generate a twist design from the current inputs."""
@@ -1032,6 +1666,14 @@ class MainWindow(QMainWindow):
         if path:
             self.dat_path_edit.setText(path)
 
+    def _update_airfoil_source_controls(self) -> None:
+        """Enable controls relevant to the selected airfoil source."""
+
+        use_dat_file = self.airfoil_source_combo.currentText() == "DAT file"
+        self.naca_edit.setEnabled(not use_dat_file)
+        self.dat_path_edit.setEnabled(use_dat_file)
+        self.dat_browse_button.setEnabled(use_dat_file)
+
     def check_xfoil(self) -> None:
         """Check whether XFOIL can be started."""
 
@@ -1150,6 +1792,7 @@ class MainWindow(QMainWindow):
 
         self.xfoil_points = result.points
         self.xfoil_reynolds_tables = result.reynolds_tables
+        self.xfoil_display_reynolds = _find_reynolds_for_points(result.points, result.reynolds_tables)
         self._fill_xfoil_table(result.points)
         self.polar_plot.update_plot(result.points)
         if result.reynolds_tables:
@@ -1215,7 +1858,12 @@ class MainWindow(QMainWindow):
         if not self.xfoil_points:
             QMessageBox.information(self, "No polar", "Please run XFOIL first.")
             return
-        path, _filter = QFileDialog.getSaveFileName(self, "Save polar CSV", "xfoil_polar.csv", "CSV files (*.csv)")
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Save polar CSV",
+            self._default_xfoil_polar_filename(),
+            "CSV files (*.csv)",
+        )
         if not path:
             return
         try:
@@ -1223,6 +1871,25 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Polar saved", "Polar CSV was written.")
         except Exception as exc:  # noqa: BLE001
             _show_error(self, "Polar save failed", str(exc))
+
+    def _default_xfoil_polar_filename(self) -> str:
+        """Return an airfoil-and-Re based default polar file name."""
+
+        airfoil_name = _safe_filename_token(self._xfoil_airfoil_name())
+        reynolds = self.xfoil_display_reynolds
+        if reynolds is None:
+            reynolds = self.xfoil_re_spin.value()
+        return f"{airfoil_name}_{_reynolds_filename_token(reynolds)}.csv"
+
+    def _xfoil_airfoil_name(self) -> str:
+        """Return the selected XFOIL airfoil name."""
+
+        if self.airfoil_source_combo.currentText() == "DAT file":
+            dat_path = self.dat_path_edit.text().strip()
+            if dat_path:
+                return Path(dat_path).stem
+            return "dat_airfoil"
+        return f"naca{self.naca_edit.text().strip() or '4412'}"
 
     def use_xfoil_polar(self) -> None:
         """Use generated XFOIL points as the active TablePolar."""
@@ -1331,6 +1998,58 @@ def _short_log(name: str, text: str, max_chars: int = 3000) -> str:
     return f"{name}:\n{trimmed}"
 
 
+def _default_xfoil_path() -> str:
+    """Return the bundled local XFOIL path when it exists."""
+
+    local_xfoil = Path(__file__).resolve().parents[2] / "tools" / "xfoil" / "xfoil-6.99" / "xfoil.exe"
+    if local_xfoil.exists():
+        return str(local_xfoil)
+    return "xfoil"
+
+
+def _find_reynolds_for_points(
+    points: list[XfoilPolarPoint],
+    reynolds_tables: dict[float, list[XfoilPolarPoint]],
+) -> float | None:
+    """Return the Reynolds table associated with displayed XFOIL points."""
+
+    if not points:
+        return None
+    for reynolds, table_points in reynolds_tables.items():
+        if table_points is points or table_points == points:
+            return float(reynolds)
+    if len(reynolds_tables) == 1:
+        return float(next(iter(reynolds_tables)))
+    return None
+
+
+def _reynolds_filename_token(reynolds: float) -> str:
+    """Return a Reynolds number token for file names."""
+
+    value = max(float(reynolds), 0.0)
+    if value >= 1000.0:
+        text = f"{value:.0f}"
+    else:
+        text = f"{value:.3g}"
+    return "Re" + _safe_filename_token(text)
+
+
+def _safe_filename_token(text: str) -> str:
+    """Return an ASCII-safe token for generated file names."""
+
+    cleaned: list[str] = []
+    previous_underscore = False
+    for char in text.strip().lower():
+        if char.isascii() and (char.isalnum() or char in ("-", ".")):
+            cleaned.append(char)
+            previous_underscore = False
+        elif not previous_underscore:
+            cleaned.append("_")
+            previous_underscore = True
+    token = "".join(cleaned).strip("._-")
+    return token or "airfoil"
+
+
 STATION_COLUMNS = [
     ("r/R", "r_over_R"),
     ("r_m", "r_m"),
@@ -1386,6 +2105,48 @@ DESIGN_COLUMNS = [
     ("Cl/Cd", "ld"),
     ("objective_value", "objective_value"),
     ("warning", "warning"),
+]
+TARGET_SUMMARY_ROWS = [
+    ("progress", "progress"),
+    ("T", "best T, N"),
+    ("Q", "best Q, N*m"),
+    ("P", "best P, W"),
+    ("eta", "best eta"),
+    ("CT", "CT"),
+    ("CQ", "CQ"),
+    ("CP", "CP"),
+    ("best_fitness", "best fitness"),
+    ("target_error", "target error"),
+    ("evaluations", "evaluations"),
+    ("target_mode", "target mode"),
+    ("optimizer_method", "optimizer method"),
+    ("max_alpha_deg", "max_alpha_deg"),
+    ("stall_fraction", "stall_fraction"),
+    ("low_re_fraction", "low_re_fraction"),
+    ("max_mach", "max_mach"),
+    ("geometry_smoothness", "geometry_smoothness"),
+]
+TARGET_HISTORY_COLUMNS = [
+    ("generation", "generation"),
+    ("evaluations", "evaluations"),
+    ("fitness", "best_fitness"),
+    ("T", "best_thrust_N"),
+    ("Q", "best_torque_Nm"),
+    ("P", "best_power_W"),
+    ("eta", "best_eta"),
+    ("CT", "best_ct"),
+    ("CQ", "best_cq"),
+    ("CP", "best_cp"),
+    ("target_error", "target_error_fraction"),
+    ("stall_fraction", "stall_fraction"),
+    ("low_re_fraction", "low_re_fraction"),
+    ("max_mach", "max_mach"),
+]
+TARGET_GEOMETRY_COLUMNS = [
+    ("r/R", "r_over_R"),
+    ("chord/R", "chord_over_R"),
+    ("beta_deg", "beta_deg"),
+    ("airfoil_id", "airfoil_id"),
 ]
 DIAGNOSTIC_KEYS = [
     "requested_mode",

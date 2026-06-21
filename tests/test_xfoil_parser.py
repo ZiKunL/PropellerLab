@@ -58,3 +58,13 @@ def test_export_xfoil_points_can_be_read_as_table_polar(tmp_path):
     assert cd == 0.0115
     assert cm == -0.04
     assert warnings == []
+
+
+def test_xfoil_script_exits_ppar_menu_after_panel_count():
+    """PPAR script should provide panel count and blank exits on separate lines."""
+
+    script = XfoilRunner._build_script(["NACA 4412"], "polar.txt", 100000.0, 0.0, 0.0, 2.0, 1.0, 50, 120)
+    lines = script.splitlines()
+    ppar_index = lines.index("PPAR")
+
+    assert lines[ppar_index + 1 : ppar_index + 5] == ["N", "120", "", ""]

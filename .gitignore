@@ -13,3 +13,10 @@ build/
 *.log
 *.tmp
 xfoil_polar.csv
+tools/xfoil/*
+data/airfoils/*
+!data/airfoils/.gitkeep
+data/blade_geometries/*
+!data/blade_geometries/.gitkeep
+data/designs/*
+!data/designs/.gitkeep

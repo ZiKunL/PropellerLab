@@ -9,6 +9,7 @@ from typing import Any
 
 from .design import DesignResult
 from .models import PropellerResult
+from .optimizer import TargetOptimizationResult
 
 
 def export_station_csv(result: PropellerResult, path: str | Path) -> None:
@@ -101,3 +102,53 @@ def export_design_station_csv(design_result: DesignResult, path: str | Path) -> 
         writer.writeheader()
         for station in design_result.stations:
             writer.writerow({name: getattr(station, name) for name in fieldnames})
+
+
+def export_optimization_history_csv(result: TargetOptimizationResult, path: str | Path) -> None:
+    """Export target optimization history rows to CSV."""
+
+    fieldnames = [
+        "generation",
+        "evaluations",
+        "best_fitness",
+        "best_thrust_N",
+        "best_torque_Nm",
+        "best_power_W",
+        "best_eta",
+        "best_ct",
+        "best_cq",
+        "best_cp",
+        "target_error_fraction",
+        "stall_fraction",
+        "low_re_fraction",
+        "max_mach",
+    ]
+    csv_path = Path(path)
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in result.history:
+            writer.writerow({name: getattr(row, name) for name in fieldnames})
+
+
+def export_optimization_summary_csv(result: TargetOptimizationResult, path: str | Path) -> None:
+    """Export target optimization input, result, diagnostics, and warnings."""
+
+    rows: list[dict[str, Any]] = []
+    for key, value in asdict(result.input).items():
+        rows.append({"section": "input", "name": key, "value": value})
+    analysis = result.best_analysis
+    for key in ("thrust_N", "torque_Nm", "power_W", "eta", "ct", "cq", "cp"):
+        rows.append({"section": "best_result", "name": key, "value": getattr(analysis, key)})
+    rows.append({"section": "best_result", "name": "best_fitness", "value": result.best_fitness})
+    rows.append({"section": "best_result", "name": "target_error_fraction", "value": result.target_error_fraction})
+    rows.append({"section": "best_result", "name": "evaluations", "value": result.evaluations})
+    for key, value in result.diagnostics.items():
+        rows.append({"section": "diagnostic", "name": key, "value": value})
+    for idx, warning in enumerate(result.warnings, start=1):
+        rows.append({"section": "warning", "name": f"warning_{idx}", "value": warning})
+    csv_path = Path(path)
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["section", "name", "value"])
+        writer.writeheader()
+        writer.writerows(rows)

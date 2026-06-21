@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from propeller_lab.core.design import DesignResult
 from propeller_lab.core.models import GeometryStation, PropellerInput, PropellerResult
+from propeller_lab.core.optimizer import TargetOptimizationResult
 from propeller_lab.core.polar import AirfoilPolar
 
 
@@ -19,3 +20,4 @@ class AppState:
     xfoil_cached_polar: AirfoilPolar | None = None
     last_analysis_result: PropellerResult | None = None
     last_design_result: DesignResult | None = None
+    last_target_optimization_result: TargetOptimizationResult | None = None
