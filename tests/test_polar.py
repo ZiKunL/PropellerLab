@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from propeller_lab.core.polar import GenericPolar, MultiRePolar, TablePolar
+from propeller_lab.core.polar import GenericPolar, MultiAirfoilPolar, MultiRePolar, TablePolar
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,3 +58,23 @@ def test_multi_re_polar_interpolates_between_tables():
     cl, _cd, _cm, warnings = multi.lookup(5.0, reynolds=150000.0)
     assert math.isclose(cl, 0.825, rel_tol=1e-6)
     assert warnings == []
+
+
+def test_multi_airfoil_polar_selects_requested_airfoil():
+    """MultiAirfoilPolar should dispatch lookup by airfoil_id."""
+
+    low = TablePolar.from_csv(ROOT / "examples" / "sample_polar.csv")
+    high = TablePolar.from_csv(ROOT / "examples" / "sample_polar.csv")
+    for point in high.points:
+        point.cl *= 2.0
+    multi = MultiAirfoilPolar()
+    multi.add_airfoil("naca1111", low)
+    multi.add_airfoil("naca2222", high)
+
+    cl_low, _cd, _cm, warnings_low = multi.lookup_for_airfoil("1111", 5.0, reynolds=100000.0)
+    cl_high, _cd, _cm, warnings_high = multi.lookup_for_airfoil("naca2222", 5.0, reynolds=100000.0)
+
+    assert math.isclose(cl_low, 0.55, rel_tol=1e-6)
+    assert math.isclose(cl_high, 1.10, rel_tol=1e-6)
+    assert warnings_low == []
+    assert warnings_high == []

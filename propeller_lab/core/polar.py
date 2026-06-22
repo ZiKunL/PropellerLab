@@ -234,6 +234,79 @@ class MultiRePolar(AirfoilPolar):
         return cl, cd, cm, _unique(w)
 
 
+class MultiAirfoilPolar(AirfoilPolar):
+    """Multiple airfoil polar models selected by airfoil_id."""
+
+    def __init__(self) -> None:
+        self.airfoils: dict[str, AirfoilPolar] = {}
+
+    def add_airfoil(self, airfoil_id: str, polar: AirfoilPolar) -> None:
+        """Add one airfoil polar."""
+
+        normalized = normalize_airfoil_id(airfoil_id)
+        if not normalized:
+            raise ValueError("airfoil_id must not be empty.")
+        self.airfoils[normalized] = polar
+
+    def lookup_for_airfoil(
+        self,
+        airfoil_id: str,
+        alpha_deg: float,
+        reynolds: float | None = None,
+        mach: float | None = None,
+    ) -> tuple[float, float, float, list[str]]:
+        """Lookup by airfoil_id, alpha, Reynolds, and Mach."""
+
+        if not self.airfoils:
+            raise ValueError("MultiAirfoilPolar has no airfoils.")
+        normalized = normalize_airfoil_id(airfoil_id)
+        polar = self.airfoils.get(normalized)
+        warnings: list[str] = []
+        if polar is None:
+            fallback_key = sorted(self.airfoils)[0]
+            polar = self.airfoils[fallback_key]
+            warnings.append(f"Airfoil '{airfoil_id}' not found; using '{fallback_key}'.")
+        cl, cd, cm, polar_warnings = polar.lookup(alpha_deg, reynolds, mach)
+        warnings.extend(polar_warnings)
+        return cl, cd, cm, _unique(warnings)
+
+    def lookup(
+        self,
+        alpha_deg: float,
+        reynolds: float | None = None,
+        mach: float | None = None,
+    ) -> tuple[float, float, float, list[str]]:
+        """Lookup using the first available airfoil when no airfoil_id is supplied."""
+
+        if not self.airfoils:
+            raise ValueError("MultiAirfoilPolar has no airfoils.")
+        key = sorted(self.airfoils)[0]
+        cl, cd, cm, warnings = self.airfoils[key].lookup(alpha_deg, reynolds, mach)
+        if len(self.airfoils) > 1:
+            warnings = [f"No airfoil_id supplied; using '{key}'."] + warnings
+        return cl, cd, cm, _unique(warnings)
+
+
+def normalize_airfoil_id(airfoil_id: str) -> str:
+    """Return a stable ASCII-ish airfoil identifier."""
+
+    text = str(airfoil_id).strip().lower()
+    if not text:
+        return ""
+    if text.isdigit():
+        text = "naca" + text
+    cleaned: list[str] = []
+    previous_underscore = False
+    for char in text:
+        if char.isascii() and (char.isalnum() or char in ("-", ".")):
+            cleaned.append(char)
+            previous_underscore = False
+        elif not previous_underscore:
+            cleaned.append("_")
+            previous_underscore = True
+    return "".join(cleaned).strip("._-")
+
+
 def _optional_float(value: object, default: float | None) -> float | None:
     """Parse an optional float field."""
 

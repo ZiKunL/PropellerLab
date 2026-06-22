@@ -131,7 +131,7 @@ Important limitation: local maximum Cl/Cd is not a complete global optimum prope
 
 Target Optimization searches for a blade geometry that meets a requested operating objective. The optimizer changes chord/R and beta control points along the blade, interpolates them into the radial station geometry, analyzes each candidate with the existing propeller solver, and keeps the lowest-fitness result.
 
-The MVP uses fixed RPM for each optimization run. It uses active polar data from GenericPolar, imported TablePolar, XFOIL cached TablePolar, or MultiRePolar. XFOIL is not called during the optimization loop; use XFOIL beforehand only to generate polar tables.
+The MVP uses fixed RPM for each optimization run. It can use active polar data from GenericPolar, imported TablePolar, XFOIL cached TablePolar, MultiRePolar, or a target-specific MultiAirfoilPolar built from NACA airfoils or DAT coordinate files. XFOIL is not called during the optimization loop; target airfoil XFOIL data is generated beforehand and then interpolated during candidate evaluation.
 
 Available target modes:
 
@@ -147,18 +147,20 @@ Available optimizer methods:
 - Genetic algorithm.
 - Genetic algorithm with a compact local refinement pass.
 
-The workspace can copy Base Calculate inputs and use the current imported or XFOIL polar. If no imported or XFOIL polar is available, the optimizer falls back to GenericPolar and reports this in the optimization log. Results include a summary, generation history, best geometry table, convergence plot, geometry/load plot, and CSV exports for best geometry, optimization history, and optimization summary.
+The workspace can copy Base Calculate inputs and use the current imported or XFOIL polar. It can also accept multiple NACA airfoils or DAT coordinate files, estimate a Reynolds range from the optimization chord/R bounds, run XFOIL for each selected airfoil at representative Reynolds values, and build a MultiAirfoilPolar. Airfoils can be used in two modes: Hybrid root-to-tip assigns the selected airfoils along one blade span, while Compare uniform airfoils optimizes one propeller per candidate airfoil, with the entire blade using that airfoil, then ranks the results. In comparison mode, NACA candidates and DAT-file candidates can be used together in the same run, such as NACA 4412, NACA 4612, and a Clark Y DAT file. Candidate geometry stations keep an `airfoil_id`, so the solver looks up the correct airfoil and interpolates across Reynolds for each station. If no imported or XFOIL polar is available, the optimizer falls back to GenericPolar and reports this in the optimization log. Results include a summary, uniform-airfoil comparison table, generation history, best geometry table, convergence plot, geometry/load plot, and CSV exports for best geometry, optimization history, and optimization summary.
 
 This feature is a bounded engineering search, not a guaranteed global optimum. Review constraints such as maximum tip Mach, maximum angle of attack, stall fraction, low-Re fraction, and smoothness before accepting a design.
 
 Recommended workflow:
 
-1. Set up GenericPolar, import a polar CSV, or generate a single-Re or multi-Re XFOIL polar.
-2. Open Target Optimization and copy Base Calculate inputs if they are already set.
-3. Enter target thrust or torque, fixed RPM, V_inf, diameter, blade count, and geometry bounds.
-4. Run the optimizer and inspect fitness, target error, warnings, and geometry plots.
-5. Apply best geometry to Base Calculate.
-6. Verify the applied geometry with normal analysis, Auto Re range, and exports.
+1. Open Target Optimization and copy Base Calculate inputs if they are already set.
+2. Enter target thrust or torque, fixed RPM, V_inf, diameter, blade count, and geometry bounds.
+3. For a single airfoil, use GenericPolar, import a polar CSV, or generate a normal XFOIL polar first.
+4. For hybrid airfoils, choose Hybrid root-to-tip, enter the airfoils in root-to-tip order, estimate the optimization Re range, then build target XFOIL polars.
+5. For uniform-airfoil comparison, choose Compare uniform airfoils, enter NACA candidates, DAT files such as Clark Y coordinates, or both, estimate the optimization Re range, then build target XFOIL polars.
+6. Run the optimizer and inspect fitness, target error, warnings, geometry plots, and the Airfoil comparison table when comparison mode is used.
+7. Apply best geometry to Base Calculate.
+8. Verify the applied geometry with normal analysis, Auto Re range, and exports.
 
 Limitations:
 
@@ -177,6 +179,8 @@ In auto mode, PropellerLab selects the low-speed solver when V_inf, J, or mu_adv
 ## XFOIL usage
 
 XFOIL is an external executable. Install XFOIL separately or provide the path to xfoil.exe in the XFOIL tab. PropellerLab can generate a NACA polar or a polar from DAT airfoil coordinate files. Generated polar data can be imported as the current TablePolar for BEMT calculations.
+
+Third-party notice: XFOIL is developed by Mark Drela and Harold Youngren and is distributed separately under the GNU General Public License from the official MIT XFOIL page. PropellerLab does not bundle, redistribute, modify, or include XFOIL source code or binaries; it only launches a user-provided XFOIL executable path. If you download, redistribute, or package XFOIL with another installer, review and comply with the XFOIL/GPL license terms.
 
 The XFOIL tab can estimate a useful Reynolds-number range from the current propeller inputs. The estimate uses each radial station:
 

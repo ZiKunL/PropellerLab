@@ -11,7 +11,7 @@ from .bemt import calculate_propeller
 from .geometry import validate_geometry
 from .models import GeometryStation, PropellerInput, PropellerResult
 from .numerics import clamp, finite_or_default, is_finite_number, safe_div
-from .polar import AirfoilPolar, GenericPolar
+from .polar import AirfoilPolar, GenericPolar, normalize_airfoil_id
 
 ProgressCallback = Callable[[int, int, object], None]
 StopCallback = Callable[[], bool]
@@ -42,6 +42,7 @@ class TargetOptimizationInput:
     chord_max_ratio: float = 0.18
     beta_min_deg: float = 2.0
     beta_max_deg: float = 45.0
+    airfoil_ids: tuple[str, ...] = ()
     max_tip_mach: float = 0.75
     max_alpha_deg: float = 18.0
     max_stall_fraction: float = 0.35
@@ -165,12 +166,39 @@ def genome_to_geometry(
                 r_over_R=finite_or_default(r_over_R),
                 chord_over_R=finite_or_default(clamp(chord, opt_input.chord_min_ratio, opt_input.chord_max_ratio)),
                 beta_deg=finite_or_default(clamp(beta, opt_input.beta_min_deg, opt_input.beta_max_deg)),
-                airfoil_id="active",
+                airfoil_id=_airfoil_id_for_radius(r_over_R, opt_input),
             )
         )
     geometry = smooth_geometry(geometry, strength=0.15)
     validate_geometry(geometry)
     return geometry
+
+
+def estimate_optimization_reynolds_range(opt_input: TargetOptimizationInput) -> dict[str, float]:
+    """Estimate Reynolds bounds from the target optimization search range."""
+
+    radius_m = max(opt_input.diameter_m / 2.0, 1e-9)
+    omega = 2.0 * math.pi * opt_input.rpm / 60.0
+    control = make_control_radii(opt_input)
+    start = control[0]
+    end = control[-1]
+    elements = max(int(opt_input.elements), 3)
+    values: list[float] = []
+    for idx in range(elements):
+        r_over_R = start + (idx + 0.5) * (end - start) / elements
+        r_m = r_over_R * radius_m
+        speed = math.hypot(opt_input.v_inf, omega * r_m)
+        for chord_ratio in (opt_input.chord_min_ratio, opt_input.chord_max_ratio):
+            chord_m = max(chord_ratio, 1e-9) * radius_m
+            reynolds = safe_div(opt_input.rho * speed * chord_m, opt_input.mu)
+            if is_finite_number(reynolds) and reynolds > 0.0:
+                values.append(reynolds)
+    if not values:
+        raise ValueError("Could not estimate Reynolds range from target optimization bounds.")
+    return {
+        "re_min": finite_or_default(min(values)),
+        "re_max": finite_or_default(max(values)),
+    }
 
 
 def interpolate_control_points(x: float, xs: list[float], ys: list[float]) -> float:
@@ -703,6 +731,21 @@ def _fallback_geometry(opt_input: TargetOptimizationInput) -> list[GeometryStati
     beta = 0.5 * (opt_input.beta_min_deg + opt_input.beta_max_deg)
     genome = [chord] * count + [beta] * count
     return genome_to_geometry(genome, opt_input)
+
+
+def _airfoil_id_for_radius(r_over_R: float, opt_input: TargetOptimizationInput) -> str:
+    """Return the root-to-tip airfoil id for one radius."""
+
+    airfoils = [normalize_airfoil_id(item) for item in opt_input.airfoil_ids if normalize_airfoil_id(item)]
+    if not airfoils:
+        return "active"
+    if len(airfoils) == 1:
+        return airfoils[0]
+    control = make_control_radii(opt_input)
+    span = max(control[-1] - control[0], 1e-9)
+    fraction = clamp((r_over_R - control[0]) / span, 0.0, 0.999999)
+    index = min(int(fraction * len(airfoils)), len(airfoils) - 1)
+    return airfoils[index]
 
 
 def _clean_evaluation(candidate: CandidateEvaluation) -> CandidateEvaluation:

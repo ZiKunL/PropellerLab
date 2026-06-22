@@ -61,11 +61,19 @@ from propeller_lab.core.optimizer import (
     OptimizationHistoryRow,
     TargetOptimizationInput,
     TargetOptimizationResult,
+    estimate_optimization_reynolds_range,
 )
-from propeller_lab.core.polar import AirfoilPolar, MultiRePolar, TablePolar
+from propeller_lab.core.polar import AirfoilPolar, MultiAirfoilPolar, MultiRePolar, TablePolar, normalize_airfoil_id
 from propeller_lab.core.xfoil_runner import XfoilPolarPoint, XfoilRunResult, XfoilRunner
 from propeller_lab.ui.app_state import AppState
-from propeller_lab.ui.optimization_worker import OptimizationWorker
+from propeller_lab.ui.optimization_worker import (
+    AirfoilComparisonWorker,
+    OptimizationWorker,
+    TargetAirfoilComparisonResult,
+    TargetAirfoilXfoilItem,
+    TargetAirfoilXfoilResult,
+    TargetAirfoilXfoilWorker,
+)
 from propeller_lab.ui.plot_widgets import (
     AeroPlotWidget,
     DesignPlotWidget,
@@ -97,7 +105,11 @@ class MainWindow(QMainWindow):
         self.xfoil_thread: QThread | None = None
         self.xfoil_worker: XfoilWorker | None = None
         self.optimization_thread: QThread | None = None
-        self.optimization_worker: OptimizationWorker | None = None
+        self.optimization_worker: OptimizationWorker | AirfoilComparisonWorker | None = None
+        self.target_xfoil_thread: QThread | None = None
+        self.target_xfoil_worker: TargetAirfoilXfoilWorker | None = None
+        self.target_airfoil_polar: MultiAirfoilPolar | None = None
+        self.target_airfoil_comparison_result: TargetAirfoilComparisonResult | None = None
         self.target_progress_history: list[OptimizationHistoryRow] = []
         self._pitch_syncing = False
 
@@ -644,6 +656,7 @@ class MainWindow(QMainWindow):
         controls = QWidget()
         controls_layout = QVBoxLayout(controls)
         controls_layout.addWidget(self._target_conditions_group())
+        controls_layout.addWidget(self._target_airfoil_group())
         controls_layout.addWidget(self._target_bounds_group())
         controls_layout.addWidget(self._target_algorithm_group())
         controls_layout.addWidget(self._target_button_group())
@@ -708,6 +721,55 @@ class MainWindow(QMainWindow):
         self.target_mode_combo.currentIndexChanged.connect(self._update_target_mode_controls)
         self.sync_target_base_button.clicked.connect(self._sync_target_from_base)
         self.use_target_polar_button.clicked.connect(self._refresh_target_polar_label)
+        return group
+
+    def _target_airfoil_group(self) -> QGroupBox:
+        """Build target multi-airfoil preprocessing controls."""
+
+        group = QGroupBox("Airfoils and XFOIL preprocessing")
+        layout = QFormLayout(group)
+        self.target_airfoil_mode_combo = QComboBox()
+        self.target_airfoil_mode_combo.addItem("Hybrid root-to-tip", "hybrid")
+        self.target_airfoil_mode_combo.addItem("Compare uniform airfoils", "compare_uniform")
+        self.target_airfoil_source_combo = QComboBox()
+        self.target_airfoil_source_combo.addItem("NACA list", "naca")
+        self.target_airfoil_source_combo.addItem("DAT files", "dat")
+        self.target_airfoil_source_combo.addItem("NACA + DAT candidates", "mixed")
+        self.target_airfoil_codes_edit = QLineEdit("4412")
+        self.target_airfoil_codes_edit.setPlaceholderText("4412, 2412, 0012")
+        self.target_dat_paths_edit = QTextEdit()
+        self.target_dat_paths_edit.setPlaceholderText("One DAT file path per line")
+        self.target_dat_paths_edit.setFixedHeight(70)
+        self.target_dat_browse_button = QPushButton("Browse DAT files")
+        self.target_re_min_spin = _spin_float(1000.0, 50000000.0, 50000.0, 0, 1000.0)
+        self.target_re_max_spin = _spin_float(1000.0, 50000000.0, 300000.0, 0, 1000.0)
+        self.target_re_count_spin = _spin_int(1, 7, 3)
+        self.target_estimate_re_button = QPushButton("Estimate optimization Re")
+        self.target_build_xfoil_button = QPushButton("Build target XFOIL polars")
+        self.target_airfoil_status_label = QLabel("Target airfoil polar: not built")
+        self.target_airfoil_status_label.setWordWrap(True)
+
+        layout.addRow("Airfoil optimization mode", self.target_airfoil_mode_combo)
+        layout.addRow("Airfoil source", self.target_airfoil_source_combo)
+        layout.addRow("NACA airfoils", self.target_airfoil_codes_edit)
+        layout.addRow("DAT files", self.target_dat_paths_edit)
+        layout.addRow(self.target_dat_browse_button)
+        layout.addRow("Target Re min", self.target_re_min_spin)
+        layout.addRow("Target Re max", self.target_re_max_spin)
+        layout.addRow("Target Re count", self.target_re_count_spin)
+        layout.addRow(self.target_estimate_re_button)
+        layout.addRow(self.target_build_xfoil_button)
+        layout.addRow(self.target_airfoil_status_label)
+
+        self.target_airfoil_mode_combo.currentIndexChanged.connect(self._update_target_airfoil_mode_controls)
+        self.target_airfoil_source_combo.currentIndexChanged.connect(self._update_target_airfoil_source_controls)
+        self.target_airfoil_codes_edit.textChanged.connect(self._clear_target_airfoil_polar)
+        self.target_dat_paths_edit.textChanged.connect(self._clear_target_airfoil_polar)
+        self.target_dat_browse_button.clicked.connect(self.browse_target_dat_files)
+        self.target_estimate_re_button.clicked.connect(self.estimate_target_optimization_re_range)
+        self.target_build_xfoil_button.clicked.connect(self.build_target_xfoil_polars)
+        self._update_target_airfoil_mode_controls()
+        self._update_target_airfoil_source_controls()
         return group
 
     def _target_bounds_group(self) -> QGroupBox:
@@ -808,6 +870,7 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(self._target_summary_tab(), "Optimization summary")
+        tabs.addTab(self._target_airfoil_comparison_tab(), "Airfoil comparison")
         tabs.addTab(self._target_history_table_tab(), "History")
         tabs.addTab(self._target_geometry_table_tab(), "Best geometry")
         self.target_history_plot = OptimizationHistoryPlotWidget()
@@ -832,6 +895,19 @@ class MainWindow(QMainWindow):
         self.target_warning_text.setReadOnly(True)
         self.target_warning_text.setPlaceholderText("Optimization log and warnings")
         layout.addWidget(self.target_warning_text, 1)
+        return widget
+
+    def _target_airfoil_comparison_tab(self) -> QWidget:
+        """Build target optimization uniform-airfoil comparison table."""
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self.target_airfoil_comparison_table = QTableWidget(0, len(TARGET_COMPARISON_COLUMNS))
+        self.target_airfoil_comparison_table.setHorizontalHeaderLabels(TARGET_COMPARISON_COLUMNS)
+        self.target_airfoil_comparison_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.target_airfoil_comparison_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.target_airfoil_comparison_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.target_airfoil_comparison_table)
         return widget
 
     def _target_history_table_tab(self) -> QWidget:
@@ -1048,18 +1124,28 @@ class MainWindow(QMainWindow):
     def _refresh_target_polar_label(self) -> None:
         """Refresh the target optimization polar status label."""
 
-        mode = str(self.polar_mode_combo.currentData())
-        if mode == "generic":
-            text = "Polar: Generic airfoil"
-        elif self.current_polar is None:
-            text = "Polar: missing; optimizer will use Generic airfoil"
-        elif isinstance(self.current_polar, MultiRePolar):
-            text = "Polar: current Multi-Re table"
-        elif isinstance(self.current_polar, TablePolar):
-            text = f"Polar: current table with {len(self.current_polar.points)} point(s)"
+        if self.target_airfoil_polar is not None:
+            text = f"Polar: target XFOIL multi-airfoil ({len(self.target_airfoil_polar.airfoils)} airfoil(s))"
         else:
-            text = "Polar: current imported polar"
+            mode = str(self.polar_mode_combo.currentData())
+            if mode == "generic":
+                text = "Polar: Generic airfoil"
+            elif self.current_polar is None:
+                text = "Polar: missing; optimizer will use Generic airfoil"
+            elif isinstance(self.current_polar, MultiAirfoilPolar):
+                text = f"Polar: current multi-airfoil ({len(self.current_polar.airfoils)} airfoil(s))"
+            elif isinstance(self.current_polar, MultiRePolar):
+                text = "Polar: current Multi-Re table"
+            elif isinstance(self.current_polar, TablePolar):
+                text = f"Polar: current table with {len(self.current_polar.points)} point(s)"
+            else:
+                text = "Polar: current imported polar"
         self.target_polar_label.setText(text)
+        if self.target_airfoil_polar is None:
+            return
+        self.target_airfoil_status_label.setText(
+            f"Target airfoil polar: {len(self.target_airfoil_polar.airfoils)} airfoil(s) ready"
+        )
 
     def _update_target_mode_controls(self, *_args: object) -> None:
         """Enable only target fields relevant to the selected objective."""
@@ -1071,6 +1157,208 @@ class MainWindow(QMainWindow):
         self.target_thrust_spin.setEnabled(uses_thrust)
         self.target_torque_spin.setEnabled(uses_torque)
         self.target_torque_limit_spin.setEnabled(uses_torque_limit)
+
+    def _target_airfoil_source(self) -> str:
+        """Return the selected target airfoil source type."""
+
+        return str(self.target_airfoil_source_combo.currentData())
+
+    def _target_airfoil_mode(self) -> str:
+        """Return how selected target airfoils are used."""
+
+        return str(self.target_airfoil_mode_combo.currentData())
+
+    def _update_target_airfoil_mode_controls(self, *_args: object) -> None:
+        """Update target airfoil entry hints for the selected mode."""
+
+        if self._target_airfoil_mode() == "compare_uniform":
+            mixed_index = self.target_airfoil_source_combo.findData("mixed")
+            if mixed_index >= 0 and self._target_airfoil_source() != "mixed":
+                self.target_airfoil_source_combo.setCurrentIndex(mixed_index)
+            self.target_airfoil_codes_edit.setPlaceholderText("4412, 4612, 0012")
+            self.target_dat_paths_edit.setPlaceholderText("One DAT candidate file path per line")
+        else:
+            if self._target_airfoil_source() == "mixed":
+                self.target_airfoil_source_combo.setCurrentIndex(0)
+            self.target_airfoil_codes_edit.setPlaceholderText("4412, 2412, 0012")
+            self.target_dat_paths_edit.setPlaceholderText("One DAT file path per line, root-to-tip")
+        self._update_target_airfoil_source_controls()
+
+    def _update_target_airfoil_source_controls(self, *_args: object) -> None:
+        """Enable target airfoil controls for the selected source."""
+
+        compare_mode = self._target_airfoil_mode() == "compare_uniform"
+        if not compare_mode and self._target_airfoil_source() == "mixed":
+            self.target_airfoil_source_combo.setCurrentIndex(0)
+            return
+        use_dat = self._target_airfoil_source() == "dat"
+        use_mixed = compare_mode
+        self.target_airfoil_source_combo.setEnabled(not compare_mode)
+        self.target_airfoil_codes_edit.setEnabled(use_mixed or not use_dat)
+        self.target_dat_paths_edit.setEnabled(use_mixed or use_dat)
+        self.target_dat_browse_button.setEnabled(use_mixed or use_dat)
+        self._clear_target_airfoil_polar()
+
+    def browse_target_dat_files(self) -> None:
+        """Browse for target DAT airfoil files."""
+
+        paths, _filter = QFileDialog.getOpenFileNames(self, "Select target DAT files", "", "DAT files (*.dat);;All files (*)")
+        if paths:
+            self.target_dat_paths_edit.setPlainText("\n".join(paths))
+
+    def _target_airfoil_ids(self) -> list[str]:
+        """Return selected target airfoils."""
+
+        if self._target_airfoil_mode() == "compare_uniform":
+            return _unique_strings(self._target_naca_airfoil_ids(default_to_4412=False) + self._target_dat_airfoil_ids())
+        if self._target_airfoil_source() == "dat":
+            return self._target_dat_airfoil_ids()
+        return self._target_naca_airfoil_ids(default_to_4412=True)
+
+    def _target_airfoil_items(self) -> list[TargetAirfoilXfoilItem]:
+        """Return target XFOIL preprocessing items with explicit source type."""
+
+        if self._target_airfoil_mode() == "compare_uniform":
+            items = [TargetAirfoilXfoilItem("naca", airfoil_id) for airfoil_id in self._target_naca_airfoil_ids(default_to_4412=False)]
+            items.extend(TargetAirfoilXfoilItem("dat", path) for path in self._target_dat_paths())
+            return _unique_xfoil_items(items)
+        if self._target_airfoil_source() == "dat":
+            return [TargetAirfoilXfoilItem("dat", path) for path in self._target_dat_paths()]
+        return [TargetAirfoilXfoilItem("naca", airfoil_id) for airfoil_id in self._target_naca_airfoil_ids(default_to_4412=True)]
+
+    def _target_naca_airfoil_ids(self, default_to_4412: bool) -> list[str]:
+        """Return NACA target airfoil ids from the NACA input."""
+
+        text = self.target_airfoil_codes_edit.text()
+        raw_items = [item.strip() for item in text.replace(";", ",").split(",")]
+        airfoils = [normalize_airfoil_id(item) for item in raw_items if normalize_airfoil_id(item)]
+        if not airfoils and default_to_4412:
+            return ["naca4412"]
+        return _unique_strings(airfoils)
+
+    def _target_dat_airfoil_ids(self) -> list[str]:
+        """Return DAT target airfoil ids from DAT filenames."""
+
+        airfoils = [normalize_airfoil_id(Path(path).stem) for path in self._target_dat_paths() if normalize_airfoil_id(Path(path).stem)]
+        return _unique_strings(airfoils)
+
+    def _target_dat_paths(self) -> list[str]:
+        """Return selected DAT paths."""
+
+        paths: list[str] = []
+        for line in self.target_dat_paths_edit.toPlainText().splitlines():
+            text = line.strip().strip('"')
+            if text:
+                paths.append(text)
+        return paths
+
+    def _clear_target_airfoil_polar(self, *_args: object) -> None:
+        """Clear cached target airfoil polar after airfoil list edits."""
+
+        self.target_airfoil_polar = None
+        self.target_airfoil_status_label.setText("Target airfoil polar: not built")
+
+    def estimate_target_optimization_re_range(self) -> None:
+        """Estimate target optimization Reynolds bounds from search ranges."""
+
+        try:
+            estimate = estimate_optimization_reynolds_range(self._target_optimization_input())
+            re_min = estimate["re_min"]
+            re_max = estimate["re_max"]
+            _set_spin_value_silently(self.target_re_min_spin, re_min)
+            _set_spin_value_silently(self.target_re_max_spin, re_max)
+            values = representative_reynolds_values(re_min, re_max, self.target_re_count_spin.value())
+            self._append_target_log(
+                "Estimated target optimization Re range: "
+                f"{re_min:.6g} to {re_max:.6g}; values: "
+                + ", ".join(f"{value:.6g}" for value in values)
+            )
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Target Re estimate failed", str(exc))
+
+    def build_target_xfoil_polars(self) -> None:
+        """Build target multi-airfoil XFOIL polar tables."""
+
+        if self.target_xfoil_thread is not None:
+            QMessageBox.information(self, "Target XFOIL", "Target XFOIL preprocessing is already running.")
+            return
+        try:
+            estimate = estimate_optimization_reynolds_range(self._target_optimization_input())
+            re_min = estimate["re_min"]
+            re_max = estimate["re_max"]
+            _set_spin_value_silently(self.target_re_min_spin, re_min)
+            _set_spin_value_silently(self.target_re_max_spin, re_max)
+            reynolds_values = representative_reynolds_values(re_min, re_max, self.target_re_count_spin.value())
+            airfoil_items = self._target_airfoil_items()
+            airfoil_ids = self._target_airfoil_ids()
+            if not airfoil_items:
+                raise ValueError("Please select at least one target airfoil.")
+        except Exception as exc:  # noqa: BLE001
+            _show_error(self, "Target XFOIL setup failed", str(exc))
+            return
+        self.target_airfoil_polar = None
+        self.target_airfoil_status_label.setText("Target airfoil polar: building")
+        self._append_target_log(
+            "Starting target XFOIL preprocessing for "
+            + ", ".join(airfoil_ids)
+            + " at Re values "
+            + ", ".join(f"{value:.6g}" for value in reynolds_values)
+        )
+        self.target_build_xfoil_button.setEnabled(False)
+        self.target_xfoil_thread = QThread(self)
+        self.target_xfoil_worker = TargetAirfoilXfoilWorker(
+            self.xfoil_path_edit.text() or "xfoil",
+            airfoil_items,
+            reynolds_values,
+            self.xfoil_mach_spin.value(),
+            self.alpha_start_spin.value(),
+            self.alpha_end_spin.value(),
+            self.alpha_step_spin.value(),
+            self.iter_spin.value(),
+            self.panels_spin.value(),
+            self.timeout_spin.value(),
+            source_type=self._target_airfoil_source(),
+        )
+        self.target_xfoil_worker.moveToThread(self.target_xfoil_thread)
+        self.target_xfoil_thread.started.connect(self.target_xfoil_worker.run)
+        self.target_xfoil_worker.log.connect(self._append_target_log)
+        self.target_xfoil_worker.finished.connect(self._target_xfoil_finished)
+        self.target_xfoil_worker.failed.connect(self._target_xfoil_failed)
+        self.target_xfoil_worker.finished.connect(self.target_xfoil_thread.quit)
+        self.target_xfoil_worker.failed.connect(self.target_xfoil_thread.quit)
+        self.target_xfoil_thread.finished.connect(self._target_xfoil_cleanup)
+        self.target_xfoil_thread.start()
+
+    def _target_xfoil_finished(self, result: TargetAirfoilXfoilResult) -> None:
+        """Handle completed target XFOIL preprocessing."""
+
+        self.target_airfoil_polar = result.polar
+        self.target_airfoil_status_label.setText(
+            "Target airfoil polar: "
+            f"{len(result.airfoil_ids)} airfoil(s), {len(result.reynolds_values)} Re value(s)"
+        )
+        self._refresh_target_polar_label()
+        if result.warnings:
+            self._append_target_log("Target XFOIL warnings:")
+            self._append_target_log("\n".join(result.warnings))
+
+    def _target_xfoil_failed(self, message: str) -> None:
+        """Handle failed target XFOIL preprocessing."""
+
+        self.target_airfoil_status_label.setText("Target airfoil polar: failed")
+        self._append_target_log(f"Target XFOIL failed: {message}")
+        QMessageBox.warning(self, "Target XFOIL failed", message)
+
+    def _target_xfoil_cleanup(self) -> None:
+        """Release target XFOIL worker thread references."""
+
+        self.target_build_xfoil_button.setEnabled(True)
+        if self.target_xfoil_worker is not None:
+            self.target_xfoil_worker.deleteLater()
+        if self.target_xfoil_thread is not None:
+            self.target_xfoil_thread.deleteLater()
+        self.target_xfoil_worker = None
+        self.target_xfoil_thread = None
 
     def _target_optimization_input(self) -> TargetOptimizationInput:
         """Read TargetOptimizationInput from controls."""
@@ -1103,6 +1391,7 @@ class MainWindow(QMainWindow):
             chord_max_ratio=self.target_chord_max_spin.value(),
             beta_min_deg=self.target_beta_min_spin.value(),
             beta_max_deg=self.target_beta_max_spin.value(),
+            airfoil_ids=tuple(self._target_airfoil_ids()),
             max_tip_mach=self.target_max_tip_mach_spin.value(),
             max_alpha_deg=self.target_max_alpha_spin.value(),
             max_stall_fraction=self.target_max_stall_fraction_spin.value(),
@@ -1127,6 +1416,13 @@ class MainWindow(QMainWindow):
     def _target_optimization_polar(self) -> AirfoilPolar | None:
         """Return the polar for target optimization, falling back to GenericPolar."""
 
+        if self.target_airfoil_polar is not None:
+            self._append_target_log("Using target XFOIL multi-airfoil polar.")
+            return self.target_airfoil_polar
+        if len(self._target_airfoil_ids()) > 1 and not isinstance(self.current_polar, MultiAirfoilPolar):
+            if self._target_airfoil_mode() == "compare_uniform":
+                raise ValueError("Airfoil comparison requires Build target XFOIL polars before optimization.")
+            raise ValueError("Hybrid multi-airfoil optimization requires Build target XFOIL polars before optimization.")
         mode = str(self.polar_mode_combo.currentData())
         if mode == "generic":
             return None
@@ -1145,27 +1441,45 @@ class MainWindow(QMainWindow):
             opt_input = self._target_optimization_input()
             self.target_warning_text.clear()
             polar = self._target_optimization_polar()
+            compare_airfoils = self._target_airfoil_ids()
+            compare_mode = self._target_airfoil_mode() == "compare_uniform"
+            if compare_mode:
+                if len(compare_airfoils) < 2:
+                    raise ValueError("Airfoil comparison requires at least two target airfoils.")
+                if not isinstance(polar, MultiAirfoilPolar):
+                    raise ValueError("Airfoil comparison requires target XFOIL multi-airfoil polar data.")
+                missing = [airfoil_id for airfoil_id in compare_airfoils if airfoil_id not in polar.airfoils]
+                if missing:
+                    raise ValueError("Missing polar data for airfoil(s): " + ", ".join(missing))
         except Exception as exc:  # noqa: BLE001
             _show_error(self, "Target optimization setup failed", str(exc))
             return
-        self._append_target_log("Starting target optimization.")
+        if compare_mode:
+            self._append_target_log("Starting uniform-airfoil comparison: " + ", ".join(compare_airfoils))
+        else:
+            self._append_target_log("Starting target optimization.")
         self._append_target_log("Model-based optimizer only; not CFD, structural, noise, or guaranteed global optimum.")
+        self.target_airfoil_comparison_result = None
         self.target_progress_history = []
         self._fill_target_history_table([])
         self._fill_target_geometry_table([])
+        self._fill_target_airfoil_comparison_table([])
         self.start_target_button.setEnabled(False)
         self.stop_target_button.setEnabled(True)
         self.optimization_thread = QThread(self)
-        self.optimization_worker = OptimizationWorker(
-            opt_input,
-            polar,
-            clone_geometry(self.current_geometry) if self.current_geometry is not None else None,
-        )
+        base_geometry = clone_geometry(self.current_geometry) if self.current_geometry is not None else None
+        if compare_mode:
+            self.optimization_worker = AirfoilComparisonWorker(opt_input, polar, base_geometry, compare_airfoils)
+        else:
+            self.optimization_worker = OptimizationWorker(opt_input, polar, base_geometry)
         self.optimization_worker.moveToThread(self.optimization_thread)
         self.optimization_thread.started.connect(self.optimization_worker.run)
         self.optimization_worker.log.connect(self._append_target_log)
         self.optimization_worker.progress.connect(self._target_optimization_progress)
-        self.optimization_worker.finished.connect(self._target_optimization_finished)
+        if compare_mode:
+            self.optimization_worker.finished.connect(self._target_airfoil_comparison_finished)
+        else:
+            self.optimization_worker.finished.connect(self._target_optimization_finished)
         self.optimization_worker.failed.connect(self._target_optimization_failed)
         self.optimization_worker.finished.connect(self.optimization_thread.quit)
         self.optimization_worker.failed.connect(self.optimization_thread.quit)
@@ -1215,13 +1529,35 @@ class MainWindow(QMainWindow):
     def _target_optimization_finished(self, result: TargetOptimizationResult) -> None:
         """Handle completed target optimization."""
 
+        self.target_airfoil_comparison_result = None
         self.app_state.last_target_optimization_result = result
         self._show_target_optimization_result(result)
+        self._fill_target_airfoil_comparison_table([])
         self.apply_target_button.setEnabled(True)
         self.export_target_geometry_button.setEnabled(True)
         self.export_target_history_button.setEnabled(True)
         self.export_target_summary_button.setEnabled(True)
         self._append_target_log("Target optimization result is ready.")
+
+    def _target_airfoil_comparison_finished(self, result: TargetAirfoilComparisonResult) -> None:
+        """Handle completed uniform-airfoil comparison optimization."""
+
+        self.target_airfoil_comparison_result = result
+        self._fill_target_airfoil_comparison_table(result.entries)
+        best_entry = result.entries[0]
+        self.app_state.last_target_optimization_result = best_entry.result
+        self._show_target_optimization_result(best_entry.result)
+        self._fill_target_airfoil_comparison_table(result.entries)
+        self.apply_target_button.setEnabled(True)
+        self.export_target_geometry_button.setEnabled(True)
+        self.export_target_history_button.setEnabled(True)
+        self.export_target_summary_button.setEnabled(True)
+        self._append_target_log(
+            f"Airfoil comparison result is ready. Best uniform airfoil: {best_entry.airfoil_id}."
+        )
+        if result.warnings:
+            self._append_target_log("Airfoil comparison warnings:")
+            self._append_target_log("\n".join(result.warnings))
 
     def _target_optimization_failed(self, message: str) -> None:
         """Handle failed target optimization."""
@@ -1353,6 +1689,36 @@ class MainWindow(QMainWindow):
             for col, (_label, attr) in enumerate(TARGET_HISTORY_COLUMNS):
                 value = getattr(row, attr)
                 self.target_history_table.setItem(row_index, col, QTableWidgetItem(_fmt(value) if isinstance(value, float) else str(value)))
+
+    def _fill_target_airfoil_comparison_table(self, entries: list[Any]) -> None:
+        """Populate the uniform-airfoil comparison table."""
+
+        sorted_entries = sorted(entries, key=lambda entry: entry.result.best_fitness)
+        self.target_airfoil_comparison_table.setRowCount(len(sorted_entries))
+        for row_index, entry in enumerate(sorted_entries):
+            result = entry.result
+            analysis = result.best_analysis
+            values: list[object] = [
+                row_index + 1,
+                entry.airfoil_id,
+                result.best_fitness,
+                result.target_error_fraction,
+                analysis.thrust_N,
+                analysis.torque_Nm,
+                analysis.power_W,
+                analysis.eta,
+                analysis.ct,
+                analysis.cq,
+                analysis.cp,
+                result.evaluations,
+                len(result.warnings),
+            ]
+            for col, value in enumerate(values):
+                self.target_airfoil_comparison_table.setItem(
+                    row_index,
+                    col,
+                    QTableWidgetItem(_fmt(value) if isinstance(value, float) else str(value)),
+                )
 
     def _fill_target_geometry_table(self, geometry: list[GeometryStation]) -> None:
         """Populate the target optimization best geometry table."""
@@ -1983,6 +2349,31 @@ def _fmt(value: object) -> str:
     return str(value)
 
 
+def _unique_strings(items: list[str]) -> list[str]:
+    """Return strings without duplicates."""
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _unique_xfoil_items(items: list[TargetAirfoilXfoilItem]) -> list[TargetAirfoilXfoilItem]:
+    """Return XFOIL target items without duplicate final airfoil ids."""
+
+    seen: set[str] = set()
+    out: list[TargetAirfoilXfoilItem] = []
+    for item in items:
+        airfoil_id = normalize_airfoil_id(Path(item.value).stem) if item.source_type == "dat" else normalize_airfoil_id(item.value)
+        if airfoil_id and airfoil_id not in seen:
+            seen.add(airfoil_id)
+            out.append(item)
+    return out
+
+
 def _show_error(parent: QWidget, title: str, message: str) -> None:
     """Show an error dialog."""
 
@@ -2141,6 +2532,21 @@ TARGET_HISTORY_COLUMNS = [
     ("stall_fraction", "stall_fraction"),
     ("low_re_fraction", "low_re_fraction"),
     ("max_mach", "max_mach"),
+]
+TARGET_COMPARISON_COLUMNS = [
+    "rank",
+    "airfoil_id",
+    "fitness",
+    "target_error",
+    "T",
+    "Q",
+    "P",
+    "eta",
+    "CT",
+    "CQ",
+    "CP",
+    "evaluations",
+    "warnings_count",
 ]
 TARGET_GEOMETRY_COLUMNS = [
     ("r/R", "r_over_R"),

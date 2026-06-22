@@ -11,10 +11,12 @@ import pytest
 
 from propeller_lab.core.export import export_optimization_history_csv, export_optimization_summary_csv
 from propeller_lab.core.geometry import save_geometry_csv
-from propeller_lab.core.models import GeometryStation, PolarPoint
+from propeller_lab.core.bemt import calculate_propeller
+from propeller_lab.core.models import GeometryStation, PolarPoint, PropellerInput
 from propeller_lab.core.optimizer import (
     TargetOptimizationInput,
     evaluate_candidate,
+    estimate_optimization_reynolds_range,
     geometry_to_genome,
     genome_to_geometry,
     random_genome,
@@ -22,7 +24,7 @@ from propeller_lab.core.optimizer import (
     run_random_search,
     run_target_optimization,
 )
-from propeller_lab.core.polar import MultiRePolar, TablePolar
+from propeller_lab.core.polar import MultiAirfoilPolar, MultiRePolar, TablePolar
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +75,37 @@ def test_target_optimizer_geometry_conversion_is_bounded():
     assert all(left.r_over_R < right.r_over_R for left, right in zip(geometry, geometry[1:]))
     assert all(opt_input.chord_min_ratio <= station.chord_over_R <= opt_input.chord_max_ratio for station in geometry)
     assert all(opt_input.beta_min_deg <= station.beta_deg <= opt_input.beta_max_deg for station in geometry)
+
+
+def test_target_optimizer_assigns_airfoil_ids_and_estimates_re_range():
+    """Target geometry should use root-to-tip airfoil ids and estimate Re bounds."""
+
+    opt_input = _opt_input(airfoil_ids=("4412", "2412", "0012"), elements=12)
+    geometry = genome_to_geometry(random_genome(opt_input, random.Random(5)), opt_input)
+    estimate = estimate_optimization_reynolds_range(opt_input)
+
+    assert {station.airfoil_id for station in geometry} == {"naca4412", "naca2412", "naca0012"}
+    assert estimate["re_min"] > 0.0
+    assert estimate["re_max"] > estimate["re_min"]
+
+
+def test_bemt_uses_station_airfoil_ids_with_multi_airfoil_polar():
+    """BEMT station lookup should use GeometryStation.airfoil_id."""
+
+    low = _constant_table_polar(cl=0.2)
+    high = _constant_table_polar(cl=1.1)
+    polar = MultiAirfoilPolar()
+    polar.add_airfoil("naca1111", low)
+    polar.add_airfoil("naca2222", high)
+    geometry = [
+        GeometryStation(0.35, 0.10, 20.0, "naca1111"),
+        GeometryStation(0.75, 0.10, 20.0, "naca2222"),
+    ]
+
+    result = calculate_propeller(PropellerInput(elements=2, v_inf=8.0, calculation_mode="simple"), polar=polar, geometry=geometry)
+
+    assert math.isclose(result.stations[0].cl, 0.2, rel_tol=1e-12)
+    assert math.isclose(result.stations[1].cl, 1.1, rel_tol=1e-12)
 
 
 def test_evaluate_candidate_returns_finite_default_result():
@@ -126,6 +159,102 @@ def test_imported_sample_polar_works_with_optimizer():
     _assert_no_invalid_numbers(result)
 
 
+def test_multi_airfoil_polar_works_with_optimizer():
+    """Optimizer should work with a MultiAirfoilPolar and assigned airfoil ids."""
+
+    polar = MultiAirfoilPolar()
+    polar.add_airfoil("naca4412", _multi_re_polar())
+    polar.add_airfoil("naca2412", _multi_re_polar(cl_scale=0.95))
+    result = run_target_optimization(
+        _opt_input(optimizer_method="random_search", airfoil_ids=("4412", "2412")),
+        polar=polar,
+    )
+
+    assert {station.airfoil_id for station in result.best_geometry} == {"naca4412", "naca2412"}
+    assert result.best_analysis is not None
+    _assert_no_invalid_numbers(result)
+
+
+def test_airfoil_comparison_worker_runs_uniform_candidates():
+    """Uniform-airfoil comparison should optimize every candidate airfoil separately."""
+
+    from propeller_lab.ui.optimization_worker import AirfoilComparisonWorker, TargetAirfoilComparisonResult
+
+    polar = MultiAirfoilPolar()
+    polar.add_airfoil("naca4412", _multi_re_polar())
+    polar.add_airfoil("naca4612", _multi_re_polar(cl_scale=1.04))
+    worker = AirfoilComparisonWorker(
+        _opt_input(optimizer_method="random_search", airfoil_ids=("4412", "4612")),
+        polar,
+        None,
+        ["4412", "4612"],
+    )
+    finished: list[TargetAirfoilComparisonResult] = []
+    failed: list[str] = []
+    worker.finished.connect(finished.append)
+    worker.failed.connect(failed.append)
+
+    worker.run()
+
+    assert failed == []
+    assert len(finished) == 1
+    result = finished[0]
+    assert {entry.airfoil_id for entry in result.entries} == {"naca4412", "naca4612"}
+    for entry in result.entries:
+        assert {station.airfoil_id for station in entry.result.best_geometry} == {entry.airfoil_id}
+        _assert_no_invalid_numbers(entry.result)
+
+
+def test_target_airfoil_xfoil_worker_accepts_mixed_sources(monkeypatch, tmp_path):
+    """Target XFOIL preprocessing should allow NACA and DAT candidates together."""
+
+    from propeller_lab.core.xfoil_runner import XfoilPolarPoint, XfoilRunResult
+    from propeller_lab.ui import optimization_worker as worker_module
+    from propeller_lab.ui.optimization_worker import TargetAirfoilXfoilItem, TargetAirfoilXfoilResult, TargetAirfoilXfoilWorker
+
+    calls: list[tuple[str, str]] = []
+
+    class FakeRunner:
+        def __init__(self, _xfoil_path: str, _timeout: float) -> None:
+            pass
+
+        def run_naca_alpha_sweep(self, naca_code: str, *_args: object) -> XfoilRunResult:
+            calls.append(("naca", naca_code))
+            return _xfoil_run_result()
+
+        def run_dat_alpha_sweep(self, dat_path: str, *_args: object) -> XfoilRunResult:
+            calls.append(("dat", Path(dat_path).name))
+            return _xfoil_run_result()
+
+    monkeypatch.setattr(worker_module, "XfoilRunner", FakeRunner)
+    dat_path = tmp_path / "Clark Y.dat"
+    dat_path.write_text("Clark Y\n1 0\n0 0\n", encoding="utf-8")
+    worker = TargetAirfoilXfoilWorker(
+        "xfoil",
+        [TargetAirfoilXfoilItem("naca", "4412"), TargetAirfoilXfoilItem("dat", str(dat_path))],
+        [80000.0],
+        0.0,
+        -2.0,
+        2.0,
+        1.0,
+        80,
+        120,
+        10.0,
+        source_type="mixed",
+    )
+    finished: list[TargetAirfoilXfoilResult] = []
+    failed: list[str] = []
+    worker.finished.connect(finished.append)
+    worker.failed.connect(failed.append)
+
+    worker.run()
+
+    assert failed == []
+    assert calls == [("naca", "4412"), ("dat", "Clark Y.dat")]
+    assert len(finished) == 1
+    assert finished[0].airfoil_ids == ["naca4412", "clark_y"]
+
+
 def test_target_optimizer_export_csv(tmp_path):
     """Optimization history and summary exports should write CSV files."""
 
@@ -154,7 +283,7 @@ def test_evaluate_candidate_handles_bad_geometry_without_nan():
     _assert_no_invalid_numbers(candidate)
 
 
-def test_main_window_target_optimization_workspace_smoke():
+def test_main_window_target_optimization_workspace_smoke(tmp_path):
     """MainWindow should expose target optimization controls."""
 
     import os
@@ -173,7 +302,44 @@ def test_main_window_target_optimization_workspace_smoke():
     assert window.workspace_stack.currentIndex() == 2
     assert hasattr(window, "start_target_button")
     assert hasattr(window, "target_mode_combo")
+    assert hasattr(window, "target_airfoil_codes_edit")
+    assert hasattr(window, "target_airfoil_mode_combo")
+    assert hasattr(window, "target_airfoil_source_combo")
+    assert hasattr(window, "target_dat_paths_edit")
+    assert hasattr(window, "target_build_xfoil_button")
+    assert hasattr(window, "target_airfoil_comparison_table")
     assert window.target_thrust_spin.isEnabled()
+    window.target_airfoil_codes_edit.setText("4412, 2412")
+    assert window._target_airfoil_ids() == ["naca4412", "naca2412"]
+    window.target_airfoil_mode_combo.setCurrentIndex(1)
+    assert window._target_airfoil_mode() == "compare_uniform"
+    assert not window.target_airfoil_source_combo.isEnabled()
+    assert window.target_airfoil_codes_edit.isEnabled()
+    assert window.target_dat_paths_edit.isEnabled()
+    root_dat = tmp_path / "Root Airfoil.dat"
+    tip_dat = tmp_path / "tip-airfoil.dat"
+    root_dat.write_text("Root\n0 0\n1 0\n", encoding="utf-8")
+    tip_dat.write_text("Tip\n0 0\n1 0\n", encoding="utf-8")
+    window.target_dat_paths_edit.setPlainText(f"{root_dat}\n{tip_dat}")
+    assert window._target_airfoil_ids() == ["naca4412", "naca2412", "root_airfoil", "tip-airfoil"]
+    mixed_items = window._target_airfoil_items()
+    assert [(item.source_type, item.value) for item in mixed_items] == [
+        ("naca", "naca4412"),
+        ("naca", "naca2412"),
+        ("dat", str(root_dat)),
+        ("dat", str(tip_dat)),
+    ]
+    window.target_airfoil_mode_combo.setCurrentIndex(0)
+    window.target_airfoil_source_combo.setCurrentIndex(1)
+    assert window._target_airfoil_ids() == ["root_airfoil", "tip-airfoil"]
+    assert [(item.source_type, item.value) for item in window._target_airfoil_items()] == [
+        ("dat", str(root_dat)),
+        ("dat", str(tip_dat)),
+    ]
+    window.target_airfoil_source_combo.setCurrentIndex(0)
+    window.estimate_target_optimization_re_range()
+    assert window.target_re_min_spin.value() > 0.0
+    assert window.target_re_max_spin.value() > window.target_re_min_spin.value()
     window.target_mode_combo.setCurrentIndex(4)
     assert not window.target_thrust_spin.isEnabled()
     assert window.target_torque_spin.isEnabled()
@@ -206,21 +372,47 @@ def _opt_input(**overrides: object) -> TargetOptimizationInput:
     return TargetOptimizationInput(**values)
 
 
-def _multi_re_polar() -> MultiRePolar:
+def _multi_re_polar(cl_scale: float = 1.0) -> MultiRePolar:
     """Return a compact finite MultiRePolar for optimizer tests."""
 
     points = [
-        PolarPoint(-8.0, -0.5, 0.035, -0.02),
-        PolarPoint(-2.0, -0.1, 0.014, -0.02),
-        PolarPoint(4.0, 0.45, 0.015, -0.03),
-        PolarPoint(8.0, 0.82, 0.024, -0.04),
-        PolarPoint(12.0, 1.0, 0.055, -0.05),
-        PolarPoint(16.0, 0.9, 0.10, -0.06),
+        PolarPoint(-8.0, -0.5 * cl_scale, 0.035, -0.02),
+        PolarPoint(-2.0, -0.1 * cl_scale, 0.014, -0.02),
+        PolarPoint(4.0, 0.45 * cl_scale, 0.015, -0.03),
+        PolarPoint(8.0, 0.82 * cl_scale, 0.024, -0.04),
+        PolarPoint(12.0, 1.0 * cl_scale, 0.055, -0.05),
+        PolarPoint(16.0, 0.9 * cl_scale, 0.10, -0.06),
     ]
     multi = MultiRePolar()
     multi.add_table(50000.0, TablePolar(points))
     multi.add_table(250000.0, TablePolar([dataclasses.replace(point, cl=point.cl * 1.08, cd=point.cd * 0.95) for point in points]))
     return multi
+
+
+def _xfoil_run_result():
+    """Return a compact successful XFOIL result for worker tests."""
+
+    from propeller_lab.core.xfoil_runner import XfoilPolarPoint, XfoilRunResult
+
+    points = [
+        XfoilPolarPoint(-2.0, -0.1, 0.02, 0.015, -0.02, None, None),
+        XfoilPolarPoint(-1.0, 0.0, 0.018, 0.014, -0.02, None, None),
+        XfoilPolarPoint(0.0, 0.1, 0.017, 0.013, -0.02, None, None),
+        XfoilPolarPoint(1.0, 0.2, 0.018, 0.014, -0.02, None, None),
+        XfoilPolarPoint(2.0, 0.3, 0.02, 0.015, -0.02, None, None),
+    ]
+    return XfoilRunResult(points, "", "", [], None, None, {80000.0: points})
+
+
+def _constant_table_polar(cl: float) -> TablePolar:
+    """Return a polar table with constant coefficients across alpha."""
+
+    return TablePolar(
+        [
+            PolarPoint(-90.0, cl, 0.02, -0.03),
+            PolarPoint(90.0, cl, 0.02, -0.03),
+        ]
+    )
 
 
 def _assert_no_invalid_numbers(value: object) -> None:

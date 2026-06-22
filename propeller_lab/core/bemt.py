@@ -240,7 +240,7 @@ def _station_from_velocity(
     alpha_deg = math.degrees(beta_rad - phi_rad)
     reynolds = safe_div(inp.rho * speed * chord_m, inp.mu)
     mach = safe_div(speed, inp.sound_speed)
-    cl, cd, cm, polar_warnings = polar.lookup(alpha_deg, reynolds, mach)
+    cl, cd, cm, polar_warnings = _lookup_polar(polar, station.airfoil_id, alpha_deg, reynolds, mach)
     q = 0.5 * inp.rho * speed * speed
     dL_dr = q * chord_m * cl
     dD_dr = q * chord_m * cd
@@ -436,7 +436,7 @@ def _hover_dimensional_values(
     alpha_deg = math.degrees(beta_rad - phi_rad)
     reynolds = safe_div(inp.rho * speed * chord_m, inp.mu)
     mach = safe_div(speed, inp.sound_speed)
-    cl, cd, cm, polar_warnings = polar.lookup(alpha_deg, reynolds, mach)
+    cl, cd, cm, polar_warnings = _lookup_polar(polar, station.airfoil_id, alpha_deg, reynolds, mach)
     q = 0.5 * inp.rho * speed * speed
     dL_dr = q * chord_m * cl
     dD_dr = q * chord_m * cd
@@ -499,7 +499,7 @@ def _phi_station(
         speed_guess = math.hypot(inp.v_inf, omega * r_m)
         reynolds = safe_div(inp.rho * speed_guess * chord_m, inp.mu)
         mach = safe_div(speed_guess, inp.sound_speed)
-        cl, cd, _cm, _warnings = polar.lookup(alpha_deg, reynolds, mach)
+        cl, cd, _cm, _warnings = _lookup_polar(polar, station.airfoil_id, alpha_deg, reynolds, mach)
         cn = cl * math.cos(phi_rad) - cd * math.sin(phi_rad)
         ct = cl * math.sin(phi_rad) + cd * math.cos(phi_rad)
         if abs(cn) < 1e-8 or abs(ct) < 1e-8:
@@ -544,7 +544,7 @@ def _phi_station(
     speed_guess = math.hypot(inp.v_inf, omega * r_m)
     reynolds_guess = safe_div(inp.rho * speed_guess * chord_m, inp.mu)
     mach_guess = safe_div(speed_guess, inp.sound_speed)
-    cl, cd, _cm, _warnings = polar.lookup(alpha_deg, reynolds_guess, mach_guess)
+    cl, cd, _cm, _warnings = _lookup_polar(polar, station.airfoil_id, alpha_deg, reynolds_guess, mach_guess)
     cn = cl * math.cos(phi_rad) - cd * math.sin(phi_rad)
     ct = cl * math.sin(phi_rad) + cd * math.cos(phi_rad)
     if abs(cn) < 1e-8 or abs(ct) < 1e-8:
@@ -594,6 +594,21 @@ def _find_phi_bracket(residual: object) -> tuple[float, float] | None:
         previous_phi = phi
         previous_value = float(value)
     return None
+
+
+def _lookup_polar(
+    polar: AirfoilPolar,
+    airfoil_id: str,
+    alpha_deg: float,
+    reynolds: float,
+    mach: float,
+) -> tuple[float, float, float, list[str]]:
+    """Lookup polar data, using airfoil_id when the polar supports it."""
+
+    lookup_for_airfoil = getattr(polar, "lookup_for_airfoil", None)
+    if callable(lookup_for_airfoil):
+        return lookup_for_airfoil(airfoil_id, alpha_deg, reynolds, mach)
+    return polar.lookup(alpha_deg, reynolds, mach)
 
 
 def _integrate_result(
