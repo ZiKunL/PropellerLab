@@ -111,6 +111,8 @@ class MainWindow(QMainWindow):
         self.target_airfoil_polar: MultiAirfoilPolar | None = None
         self.target_airfoil_comparison_result: TargetAirfoilComparisonResult | None = None
         self.target_progress_history: list[OptimizationHistoryRow] = []
+        self._target_plot_warning_shown = False
+        self._target_detail_refresh_generation = -1
         self._pitch_syncing = False
 
         central = QWidget()
@@ -689,6 +691,8 @@ class MainWindow(QMainWindow):
         self.target_power_limit_spin = _spin_float(0.0, 100000000.0, 0.0, 3, 1.0)
         self.target_blades_spin = _spin_int(1, 12, 2)
         self.target_diameter_spin = _spin_float(0.001, 10.0, 0.254, 4, 0.001)
+        self.target_diameter_min_spin = _spin_float(0.001, 10.0, 0.254, 4, 0.001)
+        self.target_diameter_max_spin = _spin_float(0.001, 10.0, 0.254, 4, 0.001)
         self.target_hub_spin = _spin_float(0.0, 9.0, 0.035, 4, 0.001)
         self.target_rpm_spin = _spin_float(0.0, 200000.0, 8000.0, 1, 100.0)
         self.target_vinf_spin = _spin_float(0.0, 400.0, 0.0, 3, 0.1)
@@ -708,6 +712,8 @@ class MainWindow(QMainWindow):
         layout.addRow("Power limit, W", self.target_power_limit_spin)
         layout.addRow("Blades B", self.target_blades_spin)
         layout.addRow("Diameter D, m", self.target_diameter_spin)
+        layout.addRow("Diameter min D, m", self.target_diameter_min_spin)
+        layout.addRow("Diameter max D, m", self.target_diameter_max_spin)
         layout.addRow("Hub diameter, m", self.target_hub_spin)
         layout.addRow("RPM", self.target_rpm_spin)
         layout.addRow("V_inf, m/s", self.target_vinf_spin)
@@ -1099,6 +1105,8 @@ class MainWindow(QMainWindow):
         pairs: list[tuple[QDoubleSpinBox | QSpinBox, float]] = [
             (self.target_blades_spin, self.blades_spin.value()),
             (self.target_diameter_spin, self.diameter_spin.value()),
+            (self.target_diameter_min_spin, self.diameter_spin.value()),
+            (self.target_diameter_max_spin, self.diameter_spin.value()),
             (self.target_hub_spin, self.hub_spin.value()),
             (self.target_rpm_spin, self.rpm_spin.value()),
             (self.target_vinf_spin, self.vinf_spin.value()),
@@ -1365,6 +1373,10 @@ class MainWindow(QMainWindow):
 
         if self.target_diameter_spin.value() <= self.target_hub_spin.value():
             raise ValueError("Diameter must be greater than hub diameter.")
+        if self.target_diameter_min_spin.value() > self.target_diameter_max_spin.value():
+            raise ValueError("Diameter min must be smaller than or equal to diameter max.")
+        if self.target_diameter_min_spin.value() <= self.target_hub_spin.value():
+            raise ValueError("Diameter min must be greater than hub diameter.")
         if self.target_chord_min_spin.value() >= self.target_chord_max_spin.value():
             raise ValueError("Chord min must be smaller than chord max.")
         if self.target_beta_min_spin.value() >= self.target_beta_max_spin.value():
@@ -1379,6 +1391,8 @@ class MainWindow(QMainWindow):
             power_limit_W=self.target_power_limit_spin.value(),
             blades=self.target_blades_spin.value(),
             diameter_m=self.target_diameter_spin.value(),
+            diameter_min_m=self.target_diameter_min_spin.value(),
+            diameter_max_m=self.target_diameter_max_spin.value(),
             hub_diameter_m=self.target_hub_spin.value(),
             rpm=self.target_rpm_spin.value(),
             v_inf=self.target_vinf_spin.value(),
@@ -1460,6 +1474,8 @@ class MainWindow(QMainWindow):
             self._append_target_log("Starting target optimization.")
         self._append_target_log("Model-based optimizer only; not CFD, structural, noise, or guaranteed global optimum.")
         self.target_airfoil_comparison_result = None
+        self._target_plot_warning_shown = False
+        self._target_detail_refresh_generation = -1
         self.target_progress_history = []
         self._fill_target_history_table([])
         self._fill_target_geometry_table([])
@@ -1496,68 +1512,95 @@ class MainWindow(QMainWindow):
     def _target_optimization_progress(self, generation: int, total: int, best: object) -> None:
         """Update target optimization progress summary."""
 
-        self.target_summary_labels["progress"].setText(f"{generation}/{total}")
-        if isinstance(best, CandidateEvaluation):
-            self.target_summary_labels["best_fitness"].setText(_fmt(best.fitness))
-            self.target_summary_labels["target_error"].setText(_fmt(best.target_error_fraction))
-            if best.analysis is not None:
-                self.target_summary_labels["T"].setText(_fmt(best.analysis.thrust_N))
-                self.target_summary_labels["Q"].setText(_fmt(best.analysis.torque_Nm))
-                self.target_summary_labels["P"].setText(_fmt(best.analysis.power_W))
-                row = OptimizationHistoryRow(
-                    generation=max(generation - 1, 0),
-                    evaluations=generation * self.target_population_spin.value(),
-                    best_fitness=best.fitness,
-                    best_thrust_N=best.analysis.thrust_N,
-                    best_torque_Nm=best.analysis.torque_Nm,
-                    best_power_W=best.analysis.power_W,
-                    best_eta=best.analysis.eta,
-                    best_ct=best.analysis.ct,
-                    best_cq=best.analysis.cq,
-                    best_cp=best.analysis.cp,
-                    target_error_fraction=best.target_error_fraction,
-                    stall_fraction=float(best.diagnostics.get("stall_fraction", 0.0)),
-                    low_re_fraction=float(best.diagnostics.get("low_re_fraction", 0.0)),
-                    max_mach=float(best.diagnostics.get("max_mach", 0.0)),
-                )
-                self.target_progress_history.append(row)
-                self._fill_target_history_table(self.target_progress_history)
-                self._fill_target_geometry_table(best.geometry)
-                self.target_history_plot.update_plot(self.target_progress_history)
-                self.target_geometry_plot.update_plot(best.geometry, best.analysis)
+        try:
+            self.target_summary_labels["progress"].setText(f"{generation}/{total}")
+            if isinstance(best, CandidateEvaluation):
+                self.target_summary_labels["best_fitness"].setText(_fmt(best.fitness))
+                self.target_summary_labels["target_error"].setText(_fmt(best.target_error_fraction))
+                if best.analysis is not None:
+                    self.target_summary_labels["T"].setText(_fmt(best.analysis.thrust_N))
+                    self.target_summary_labels["Q"].setText(_fmt(best.analysis.torque_Nm))
+                    self.target_summary_labels["P"].setText(_fmt(best.analysis.power_W))
+                    row = OptimizationHistoryRow(
+                        generation=max(generation - 1, 0),
+                        evaluations=generation * self.target_population_spin.value(),
+                        best_diameter_m=float(best.diagnostics.get("diameter_m", self.target_diameter_spin.value())),
+                        best_fitness=best.fitness,
+                        best_thrust_N=best.analysis.thrust_N,
+                        best_torque_Nm=best.analysis.torque_Nm,
+                        best_power_W=best.analysis.power_W,
+                        best_eta=best.analysis.eta,
+                        best_ct=best.analysis.ct,
+                        best_cq=best.analysis.cq,
+                        best_cp=best.analysis.cp,
+                        target_error_fraction=best.target_error_fraction,
+                        stall_fraction=float(best.diagnostics.get("stall_fraction", 0.0)),
+                        low_re_fraction=float(best.diagnostics.get("low_re_fraction", 0.0)),
+                        max_mach=float(best.diagnostics.get("max_mach", 0.0)),
+                    )
+                    self.target_progress_history.append(row)
+                    if self._should_refresh_target_details(generation, total):
+                        self._fill_target_history_table(self.target_progress_history)
+                        self._fill_target_geometry_table(best.geometry)
+                        self._safe_update_target_plots(self.target_progress_history, best.geometry, best.analysis)
+        except Exception as exc:  # noqa: BLE001 - GUI updates must not terminate the app.
+            try:
+                self._append_target_log(f"Target progress update skipped: {exc}")
+            except Exception:
+                pass
+
+    def _should_refresh_target_details(self, generation: int, total: int) -> bool:
+        """Throttle expensive target tables and plots during optimization."""
+
+        if generation <= 1 or generation >= total:
+            self._target_detail_refresh_generation = generation
+            return True
+        if generation - self._target_detail_refresh_generation >= 5:
+            self._target_detail_refresh_generation = generation
+            return True
+        return False
 
     def _target_optimization_finished(self, result: TargetOptimizationResult) -> None:
         """Handle completed target optimization."""
 
-        self.target_airfoil_comparison_result = None
-        self.app_state.last_target_optimization_result = result
-        self._show_target_optimization_result(result)
-        self._fill_target_airfoil_comparison_table([])
-        self.apply_target_button.setEnabled(True)
-        self.export_target_geometry_button.setEnabled(True)
-        self.export_target_history_button.setEnabled(True)
-        self.export_target_summary_button.setEnabled(True)
-        self._append_target_log("Target optimization result is ready.")
+        try:
+            self.target_airfoil_comparison_result = None
+            self.app_state.last_target_optimization_result = result
+            self._show_target_optimization_result(result)
+            self._fill_target_airfoil_comparison_table([])
+            self.apply_target_button.setEnabled(True)
+            self.export_target_geometry_button.setEnabled(True)
+            self.export_target_history_button.setEnabled(True)
+            self.export_target_summary_button.setEnabled(True)
+            self._append_target_log("Target optimization result is ready.")
+        except Exception as exc:  # noqa: BLE001 - GUI updates must not terminate the app.
+            self.app_state.last_target_optimization_result = result
+            self._append_target_log(f"Target result display skipped: {exc}")
 
     def _target_airfoil_comparison_finished(self, result: TargetAirfoilComparisonResult) -> None:
         """Handle completed uniform-airfoil comparison optimization."""
 
-        self.target_airfoil_comparison_result = result
-        self._fill_target_airfoil_comparison_table(result.entries)
-        best_entry = result.entries[0]
-        self.app_state.last_target_optimization_result = best_entry.result
-        self._show_target_optimization_result(best_entry.result)
-        self._fill_target_airfoil_comparison_table(result.entries)
-        self.apply_target_button.setEnabled(True)
-        self.export_target_geometry_button.setEnabled(True)
-        self.export_target_history_button.setEnabled(True)
-        self.export_target_summary_button.setEnabled(True)
-        self._append_target_log(
-            f"Airfoil comparison result is ready. Best uniform airfoil: {best_entry.airfoil_id}."
-        )
-        if result.warnings:
-            self._append_target_log("Airfoil comparison warnings:")
-            self._append_target_log("\n".join(result.warnings))
+        try:
+            self.target_airfoil_comparison_result = result
+            self._fill_target_airfoil_comparison_table(result.entries)
+            best_entry = result.entries[0]
+            self.app_state.last_target_optimization_result = best_entry.result
+            self._show_target_optimization_result(best_entry.result)
+            self._fill_target_airfoil_comparison_table(result.entries)
+            self.apply_target_button.setEnabled(True)
+            self.export_target_geometry_button.setEnabled(True)
+            self.export_target_history_button.setEnabled(True)
+            self.export_target_summary_button.setEnabled(True)
+            self._append_target_log(
+                f"Airfoil comparison result is ready. Best uniform airfoil: {best_entry.airfoil_id}."
+            )
+            if result.warnings:
+                self._append_target_log("Airfoil comparison warnings:")
+                self._append_target_log("\n".join(result.warnings))
+        except Exception as exc:  # noqa: BLE001 - GUI updates must not terminate the app.
+            if result.entries:
+                self.app_state.last_target_optimization_result = result.entries[0].result
+            self._append_target_log(f"Airfoil comparison display skipped: {exc}")
 
     def _target_optimization_failed(self, message: str) -> None:
         """Handle failed target optimization."""
@@ -1587,7 +1630,7 @@ class MainWindow(QMainWindow):
         opt_input = result.input
         self.current_geometry = clone_geometry(result.best_geometry)
         _set_spin_value_silently(self.blades_spin, opt_input.blades)
-        _set_spin_value_silently(self.diameter_spin, opt_input.diameter_m)
+        _set_spin_value_silently(self.diameter_spin, result.best_diameter_m)
         _set_spin_value_silently(self.hub_spin, opt_input.hub_diameter_m)
         _set_spin_value_silently(self.rpm_spin, opt_input.rpm)
         _set_spin_value_silently(self.vinf_spin, opt_input.v_inf)
@@ -1662,6 +1705,7 @@ class MainWindow(QMainWindow):
             "CT": analysis.ct,
             "CQ": analysis.cq,
             "CP": analysis.cp,
+            "best_diameter_m": result.best_diameter_m,
             "best_fitness": result.best_fitness,
             "target_error": result.target_error_fraction,
             "evaluations": result.evaluations,
@@ -1678,8 +1722,23 @@ class MainWindow(QMainWindow):
         self.target_warning_text.setPlainText("\n".join(warning_lines))
         self._fill_target_history_table(result.history)
         self._fill_target_geometry_table(result.best_geometry)
-        self.target_history_plot.update_plot(result.history)
-        self.target_geometry_plot.update_plot(result.best_geometry, result.best_analysis)
+        self._safe_update_target_plots(result.history, result.best_geometry, result.best_analysis)
+
+    def _safe_update_target_plots(
+        self,
+        history: list[OptimizationHistoryRow],
+        geometry: list[GeometryStation],
+        analysis: PropellerResult | None,
+    ) -> None:
+        """Update target plots without letting plotting errors close the UI."""
+
+        try:
+            self.target_history_plot.update_plot(history)
+            self.target_geometry_plot.update_plot(geometry, analysis)
+        except Exception as exc:  # noqa: BLE001 - plotting is secondary to optimization results.
+            if not self._target_plot_warning_shown:
+                self._target_plot_warning_shown = True
+                self._append_target_log(f"Target plot update skipped: {exc}")
 
     def _fill_target_history_table(self, rows: list[Any]) -> None:
         """Populate the target optimization history table."""
@@ -1701,6 +1760,7 @@ class MainWindow(QMainWindow):
             values: list[object] = [
                 row_index + 1,
                 entry.airfoil_id,
+                result.best_diameter_m,
                 result.best_fitness,
                 result.target_error_fraction,
                 analysis.thrust_N,
@@ -2506,6 +2566,7 @@ TARGET_SUMMARY_ROWS = [
     ("CT", "CT"),
     ("CQ", "CQ"),
     ("CP", "CP"),
+    ("best_diameter_m", "best diameter D, m"),
     ("best_fitness", "best fitness"),
     ("target_error", "target error"),
     ("evaluations", "evaluations"),
@@ -2520,6 +2581,7 @@ TARGET_SUMMARY_ROWS = [
 TARGET_HISTORY_COLUMNS = [
     ("generation", "generation"),
     ("evaluations", "evaluations"),
+    ("D", "best_diameter_m"),
     ("fitness", "best_fitness"),
     ("T", "best_thrust_N"),
     ("Q", "best_torque_Nm"),
@@ -2536,6 +2598,7 @@ TARGET_HISTORY_COLUMNS = [
 TARGET_COMPARISON_COLUMNS = [
     "rank",
     "airfoil_id",
+    "D",
     "fitness",
     "target_error",
     "T",

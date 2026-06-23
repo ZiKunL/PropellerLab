@@ -2346,7 +2346,11 @@ Power limit, W
 
 含义：
 
-目标优化使用的螺旋桨直径，单位 m。
+目标优化使用的参考螺旋桨直径，单位 m。
+
+当 `Diameter min D, m` 与 `Diameter max D, m` 相等时，优化使用固定直径。
+
+当 `Diameter min D, m` 小于 `Diameter max D, m` 时，优化器会把直径 D 也作为一个优化变量，在该范围内搜索最佳直径。
 
 要求：
 
@@ -2354,7 +2358,34 @@ Power limit, W
 Diameter D, m > Hub diameter, m
 ```
 
-### 13.8 Hub diameter, m
+### 13.8 Diameter min D, m
+
+含义：
+
+目标优化允许搜索的最小螺旋桨直径，单位 m。
+
+要求：
+
+```text
+Diameter min D, m > Hub diameter, m
+Diameter min D, m <= Diameter max D, m
+```
+
+作用：
+
+决定优化器可选直径范围下限。Reynolds 范围估算、几何站位半径、BEMT 分析都会覆盖该直径范围。
+
+### 13.9 Diameter max D, m
+
+含义：
+
+目标优化允许搜索的最大螺旋桨直径，单位 m。
+
+作用：
+
+决定优化器可选直径范围上限。优化完成后，summary 中的 `best diameter D, m` 表示最终选中的直径。
+
+### 13.10 Hub diameter, m
 
 含义：
 
@@ -2368,7 +2399,7 @@ Diameter D, m > Hub diameter, m
 max(hub_radius/R, 0.20)
 ```
 
-### 13.9 RPM
+### 13.11 RPM
 
 含义：
 
@@ -2378,7 +2409,7 @@ max(hub_radius/R, 0.20)
 
 当前 MVP 优化固定 RPM，不同时优化转速。
 
-### 13.10 V_inf, m/s
+### 13.12 V_inf, m/s
 
 含义：
 
@@ -2386,13 +2417,13 @@ max(hub_radius/R, 0.20)
 
 可以为 0，用于静拉力或近静拉力优化。
 
-### 13.11 Density rho
+### 13.13 Density rho
 
 含义：
 
 目标优化使用的流体密度。
 
-### 13.12 Dynamic viscosity mu
+### 13.14 Dynamic viscosity mu
 
 含义：
 
@@ -3211,6 +3242,7 @@ Best result labels 包括：
 - CT
 - CQ
 - CP
+- best diameter D, m
 - max alpha
 - max Mach
 - stall fraction
@@ -3224,6 +3256,7 @@ Best result labels 包括：
 
 - `rank`：按 fitness 从低到高排序的名次
 - `airfoil_id`：该候选整支桨使用的翼型 ID
+- `D`：该候选优化后选中的螺旋桨直径，单位 m
 - `fitness`：该候选优化后的目标函数值，越低越好
 - `target_error`：目标误差比例
 - `T`：优化后推力，单位 N

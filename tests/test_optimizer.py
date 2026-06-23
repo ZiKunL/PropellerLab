@@ -18,6 +18,8 @@ from propeller_lab.core.optimizer import (
     evaluate_candidate,
     estimate_optimization_reynolds_range,
     geometry_to_genome,
+    genome_diameter_m,
+    genome_length,
     genome_to_geometry,
     random_genome,
     run_genetic_algorithm,
@@ -36,8 +38,9 @@ def test_random_genome_returns_correct_length_and_finite_values():
     opt_input = _opt_input(control_points=5)
     genome = random_genome(opt_input, random.Random(3))
 
-    assert len(genome) == opt_input.control_points * 2
+    assert len(genome) == genome_length(opt_input)
     assert all(math.isfinite(value) for value in genome)
+    assert math.isclose(genome_diameter_m(genome, opt_input), opt_input.diameter_m, rel_tol=1e-12)
 
 
 def test_target_optimizer_random_search_returns_finite_result():
@@ -71,7 +74,7 @@ def test_target_optimizer_geometry_conversion_is_bounded():
     round_trip = geometry_to_genome(geometry, opt_input)
 
     assert len(geometry) == opt_input.elements
-    assert len(round_trip) == opt_input.control_points * 2
+    assert len(round_trip) == genome_length(opt_input)
     assert all(left.r_over_R < right.r_over_R for left, right in zip(geometry, geometry[1:]))
     assert all(opt_input.chord_min_ratio <= station.chord_over_R <= opt_input.chord_max_ratio for station in geometry)
     assert all(opt_input.beta_min_deg <= station.beta_deg <= opt_input.beta_max_deg for station in geometry)
@@ -87,6 +90,31 @@ def test_target_optimizer_assigns_airfoil_ids_and_estimates_re_range():
     assert {station.airfoil_id for station in geometry} == {"naca4412", "naca2412", "naca0012"}
     assert estimate["re_min"] > 0.0
     assert estimate["re_max"] > estimate["re_min"]
+
+
+def test_target_optimizer_can_search_diameter_range():
+    """Diameter should be an optimizer variable when min/max bounds differ."""
+
+    opt_input = _opt_input(diameter_m=0.3, diameter_min_m=0.2, diameter_max_m=0.5, optimizer_method="random_search")
+    genome = random_genome(opt_input, random.Random(9))
+    result = run_target_optimization(opt_input, polar=_multi_re_polar())
+    estimate = estimate_optimization_reynolds_range(opt_input)
+
+    assert len(genome) == genome_length(opt_input)
+    assert opt_input.diameter_min_m <= genome_diameter_m(genome, opt_input) <= opt_input.diameter_max_m
+    assert opt_input.diameter_min_m <= result.best_diameter_m <= opt_input.diameter_max_m
+    assert math.isclose(result.best_analysis.input.diameter_m, result.best_diameter_m, rel_tol=1e-12)
+    assert estimate["re_max"] > estimate["re_min"]
+
+    refined_input = _opt_input(
+        diameter_m=0.3,
+        diameter_min_m=0.2,
+        diameter_max_m=0.5,
+        optimizer_method="ga_local_refine",
+    )
+    refined_result = run_target_optimization(refined_input, polar=_multi_re_polar())
+    assert refined_input.diameter_min_m <= refined_result.best_diameter_m <= refined_input.diameter_max_m
+    assert math.isclose(refined_result.best_analysis.input.diameter_m, refined_result.best_diameter_m, rel_tol=1e-12)
 
 
 def test_bemt_uses_station_airfoil_ids_with_multi_airfoil_polar():
@@ -146,6 +174,26 @@ def test_low_speed_static_optimization_does_not_crash():
     result = run_target_optimization(_opt_input(v_inf=0.0, optimizer_method="random_search"))
 
     assert result.best_analysis is not None
+    _assert_no_invalid_numbers(result)
+
+
+def test_unreachable_target_returns_warning_not_crash():
+    """Extreme target requests should finish with an infeasibility warning."""
+
+    result = run_target_optimization(
+        _opt_input(
+            target_thrust_N=1_000_000.0,
+            power_limit_W=100_000.0,
+            diameter_m=1.9,
+            rpm=2000.0,
+            v_inf=60.0,
+            optimizer_method="random_search",
+        )
+    )
+
+    assert result.best_analysis is not None
+    assert result.target_error_fraction > 0.25
+    assert any("target may be infeasible" in warning for warning in result.warnings)
     _assert_no_invalid_numbers(result)
 
 
@@ -276,7 +324,7 @@ def test_evaluate_candidate_handles_bad_geometry_without_nan():
     """Bad candidate inputs should be repaired or converted to finite fallbacks."""
 
     opt_input = _opt_input()
-    candidate = evaluate_candidate([float("nan")] * (opt_input.control_points * 2), opt_input)
+    candidate = evaluate_candidate([float("nan")] * genome_length(opt_input), opt_input)
 
     assert candidate.analysis is not None
     assert math.isfinite(candidate.fitness)
@@ -302,6 +350,8 @@ def test_main_window_target_optimization_workspace_smoke(tmp_path):
     assert window.workspace_stack.currentIndex() == 2
     assert hasattr(window, "start_target_button")
     assert hasattr(window, "target_mode_combo")
+    assert hasattr(window, "target_diameter_min_spin")
+    assert hasattr(window, "target_diameter_max_spin")
     assert hasattr(window, "target_airfoil_codes_edit")
     assert hasattr(window, "target_airfoil_mode_combo")
     assert hasattr(window, "target_airfoil_source_combo")
@@ -337,6 +387,11 @@ def test_main_window_target_optimization_workspace_smoke(tmp_path):
         ("dat", str(tip_dat)),
     ]
     window.target_airfoil_source_combo.setCurrentIndex(0)
+    window.target_diameter_min_spin.setValue(0.2)
+    window.target_diameter_max_spin.setValue(0.5)
+    opt_input = window._target_optimization_input()
+    assert math.isclose(opt_input.diameter_min_m, 0.2, rel_tol=1e-12)
+    assert math.isclose(opt_input.diameter_max_m, 0.5, rel_tol=1e-12)
     window.estimate_target_optimization_re_range()
     assert window.target_re_min_spin.value() > 0.0
     assert window.target_re_max_spin.value() > window.target_re_min_spin.value()

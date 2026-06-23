@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .bemt import calculate_propeller
 from .geometry import validate_geometry
@@ -30,6 +30,8 @@ class TargetOptimizationInput:
     power_limit_W: float = 0.0
     blades: int = 2
     diameter_m: float = 0.254
+    diameter_min_m: float = 0.0
+    diameter_max_m: float = 0.0
     hub_diameter_m: float = 0.035
     rpm: float = 8000.0
     v_inf: float = 0.0
@@ -72,6 +74,7 @@ class OptimizationHistoryRow:
 
     generation: int
     evaluations: int
+    best_diameter_m: float
     best_fitness: float
     best_thrust_N: float
     best_torque_Nm: float
@@ -105,6 +108,7 @@ class TargetOptimizationResult:
     """Target optimization result."""
 
     input: TargetOptimizationInput
+    best_diameter_m: float
     best_geometry: list[GeometryStation]
     best_analysis: PropellerResult
     best_fitness: float
@@ -115,11 +119,76 @@ class TargetOptimizationResult:
     diagnostics: dict[str, float | str]
 
 
-def make_control_radii(opt_input: TargetOptimizationInput) -> list[float]:
+def genome_length(opt_input: TargetOptimizationInput) -> int:
+    """Return the optimizer genome length including diameter."""
+
+    return max(int(opt_input.control_points), 2) * 2 + 1
+
+
+def genome_diameter_m(genome: list[float], opt_input: TargetOptimizationInput) -> float:
+    """Return the diameter encoded in a genome."""
+
+    count = max(int(opt_input.control_points), 2)
+    if len(genome) <= 2 * count:
+        return _active_diameter_m(opt_input)
+    diameter_min, diameter_max = _diameter_bounds(opt_input)
+    return clamp(finite_or_default(genome[2 * count], _active_diameter_m(opt_input)), diameter_min, diameter_max)
+
+
+def _active_diameter_m(opt_input: TargetOptimizationInput) -> float:
+    """Return the fixed/reference diameter clamped to the optimization bounds."""
+
+    diameter_min, diameter_max = _diameter_bounds(opt_input)
+    return clamp(finite_or_default(opt_input.diameter_m, diameter_min), diameter_min, diameter_max)
+
+
+def _diameter_bounds(opt_input: TargetOptimizationInput) -> tuple[float, float]:
+    """Return valid diameter search bounds."""
+
+    base = finite_or_default(opt_input.diameter_m, 0.254)
+    if base <= 0.0:
+        base = 0.254
+    lower = finite_or_default(opt_input.diameter_min_m, 0.0)
+    upper = finite_or_default(opt_input.diameter_max_m, 0.0)
+    if lower <= 0.0 and upper <= 0.0:
+        lower = base
+        upper = base
+    elif lower <= 0.0:
+        lower = base
+    elif upper <= 0.0:
+        upper = base
+    if upper < lower:
+        lower, upper = upper, lower
+    minimum_allowed = max(finite_or_default(opt_input.hub_diameter_m, 0.0) + 1e-6, 0.001)
+    lower = max(lower, minimum_allowed)
+    upper = max(upper, lower)
+    return finite_or_default(lower), finite_or_default(upper)
+
+
+def _representative_diameters(opt_input: TargetOptimizationInput) -> list[float]:
+    """Return diameter values that cover the optimization range."""
+
+    lower, upper = _diameter_bounds(opt_input)
+    middle = 0.5 * (lower + upper)
+    out: list[float] = []
+    for value in (lower, middle, upper):
+        if all(abs(value - existing) > 1e-9 for existing in out):
+            out.append(value)
+    return out
+
+
+def _input_with_diameter(opt_input: TargetOptimizationInput, diameter_m: float) -> TargetOptimizationInput:
+    """Return an optimization input copy using one candidate diameter."""
+
+    return replace(opt_input, diameter_m=diameter_m)
+
+
+def make_control_radii(opt_input: TargetOptimizationInput, diameter_m: float | None = None) -> list[float]:
     """Return control point r/R positions."""
 
     count = max(int(opt_input.control_points), 2)
-    radius = max(opt_input.diameter_m / 2.0, 1e-9)
+    diameter = _active_diameter_m(opt_input) if diameter_m is None else diameter_m
+    radius = max(diameter / 2.0, 1e-9)
     start = max(safe_div(opt_input.hub_diameter_m / 2.0, radius), 0.20)
     end = 0.98
     if start >= end:
@@ -131,6 +200,7 @@ def random_genome(opt_input: TargetOptimizationInput, rng: random.Random) -> lis
     """Return a random finite genome."""
 
     count = max(int(opt_input.control_points), 2)
+    diameter_min, diameter_max = _diameter_bounds(opt_input)
     chords = [
         rng.uniform(opt_input.chord_min_ratio, opt_input.chord_max_ratio)
         for _ in range(count)
@@ -139,7 +209,8 @@ def random_genome(opt_input: TargetOptimizationInput, rng: random.Random) -> lis
         rng.uniform(opt_input.beta_min_deg, opt_input.beta_max_deg)
         for _ in range(count)
     ]
-    return repair_genome(chords + betas, opt_input)
+    diameter = rng.uniform(diameter_min, diameter_max)
+    return repair_genome(chords + betas + [diameter], opt_input)
 
 
 def genome_to_geometry(
@@ -150,9 +221,10 @@ def genome_to_geometry(
 
     clean = repair_genome(genome, opt_input)
     count = max(int(opt_input.control_points), 2)
+    diameter = genome_diameter_m(clean, opt_input)
     chord_values = clean[:count]
     beta_values = clean[count : 2 * count]
-    control_r = make_control_radii(opt_input)
+    control_r = make_control_radii(opt_input, diameter)
     start = control_r[0]
     end = control_r[-1]
     elements = max(int(opt_input.elements), 3)
@@ -166,7 +238,7 @@ def genome_to_geometry(
                 r_over_R=finite_or_default(r_over_R),
                 chord_over_R=finite_or_default(clamp(chord, opt_input.chord_min_ratio, opt_input.chord_max_ratio)),
                 beta_deg=finite_or_default(clamp(beta, opt_input.beta_min_deg, opt_input.beta_max_deg)),
-                airfoil_id=_airfoil_id_for_radius(r_over_R, opt_input),
+                airfoil_id=_airfoil_id_for_radius(r_over_R, opt_input, diameter),
             )
         )
     geometry = smooth_geometry(geometry, strength=0.15)
@@ -177,22 +249,23 @@ def genome_to_geometry(
 def estimate_optimization_reynolds_range(opt_input: TargetOptimizationInput) -> dict[str, float]:
     """Estimate Reynolds bounds from the target optimization search range."""
 
-    radius_m = max(opt_input.diameter_m / 2.0, 1e-9)
     omega = 2.0 * math.pi * opt_input.rpm / 60.0
-    control = make_control_radii(opt_input)
-    start = control[0]
-    end = control[-1]
     elements = max(int(opt_input.elements), 3)
     values: list[float] = []
-    for idx in range(elements):
-        r_over_R = start + (idx + 0.5) * (end - start) / elements
-        r_m = r_over_R * radius_m
-        speed = math.hypot(opt_input.v_inf, omega * r_m)
-        for chord_ratio in (opt_input.chord_min_ratio, opt_input.chord_max_ratio):
-            chord_m = max(chord_ratio, 1e-9) * radius_m
-            reynolds = safe_div(opt_input.rho * speed * chord_m, opt_input.mu)
-            if is_finite_number(reynolds) and reynolds > 0.0:
-                values.append(reynolds)
+    for diameter in _representative_diameters(opt_input):
+        radius_m = max(diameter / 2.0, 1e-9)
+        control = make_control_radii(opt_input, diameter)
+        start = control[0]
+        end = control[-1]
+        for idx in range(elements):
+            r_over_R = start + (idx + 0.5) * (end - start) / elements
+            r_m = r_over_R * radius_m
+            speed = math.hypot(opt_input.v_inf, omega * r_m)
+            for chord_ratio in (opt_input.chord_min_ratio, opt_input.chord_max_ratio):
+                chord_m = max(chord_ratio, 1e-9) * radius_m
+                reynolds = safe_div(opt_input.rho * speed * chord_m, opt_input.mu)
+                if is_finite_number(reynolds) and reynolds > 0.0:
+                    values.append(reynolds)
     if not values:
         raise ValueError("Could not estimate Reynolds range from target optimization bounds.")
     return {
@@ -239,12 +312,17 @@ def clamp_genome(genome: list[float], opt_input: TargetOptimizationInput) -> lis
     """Clamp a genome to input bounds."""
 
     count = max(int(opt_input.control_points), 2)
-    values = list(genome[: 2 * count])
+    gene_count = genome_length(opt_input)
+    values = list(genome[:gene_count])
     while len(values) < 2 * count:
         values.append(0.0)
+    if len(values) < gene_count:
+        values.append(_active_diameter_m(opt_input))
+    diameter_min, diameter_max = _diameter_bounds(opt_input)
     chords = [clamp(finite_or_default(value, opt_input.chord_min_ratio), opt_input.chord_min_ratio, opt_input.chord_max_ratio) for value in values[:count]]
     betas = [clamp(finite_or_default(value, opt_input.beta_min_deg), opt_input.beta_min_deg, opt_input.beta_max_deg) for value in values[count:]]
-    return chords + betas
+    diameter = clamp(finite_or_default(values[2 * count], _active_diameter_m(opt_input)), diameter_min, diameter_max)
+    return chords + betas[:count] + [diameter]
 
 
 def repair_genome(genome: list[float], opt_input: TargetOptimizationInput) -> list[float]:
@@ -259,7 +337,7 @@ def repair_genome(genome: list[float], opt_input: TargetOptimizationInput) -> li
     for idx in range(1, count):
         max_step = max(opt_input.chord_max_ratio - opt_input.chord_min_ratio, 1e-9) * 0.75
         chords[idx] = clamp(chords[idx], chords[idx - 1] - max_step, chords[idx - 1] + max_step)
-    return clamp_genome(chords + betas, opt_input)
+    return clamp_genome(chords + betas[:count] + [genome_diameter_m(clean, opt_input)], opt_input)
 
 
 def evaluate_candidate(
@@ -271,12 +349,15 @@ def evaluate_candidate(
 
     polar_model = polar if polar is not None else GenericPolar()
     clean = repair_genome(genome, opt_input)
+    diameter = genome_diameter_m(clean, opt_input)
+    candidate_input = _input_with_diameter(opt_input, diameter)
     try:
-        geometry = genome_to_geometry(clean, opt_input)
-        prop_input = _propeller_input_from_optimizer(opt_input)
+        geometry = genome_to_geometry(clean, candidate_input)
+        prop_input = _propeller_input_from_optimizer(candidate_input)
         analysis = calculate_propeller(prop_input, polar=polar_model, geometry=geometry)
-        diagnostics = _analysis_diagnostics(analysis, opt_input, geometry)
-        fitness, target_error, penalties, warnings = compute_fitness(analysis, opt_input, geometry, diagnostics)
+        diagnostics = _analysis_diagnostics(analysis, candidate_input, geometry)
+        diagnostics["diameter_m"] = diameter
+        fitness, target_error, penalties, warnings = compute_fitness(analysis, candidate_input, geometry, diagnostics)
         warnings.extend(analysis.warnings)
         return _clean_evaluation(
             CandidateEvaluation(clean, geometry, analysis, fitness, target_error, penalties, diagnostics, _unique(warnings))
@@ -453,8 +534,12 @@ def run_ga_local_refine(
 ) -> TargetOptimizationResult:
     """Run GA followed by a compact coordinate refinement."""
 
+    count = max(int(opt_input.control_points), 2)
     result = run_genetic_algorithm(opt_input, polar, progress_callback, stop_callback, base_geometry)
     best_genome = geometry_to_genome(result.best_geometry, opt_input)
+    if len(best_genome) >= genome_length(opt_input):
+        best_genome[-1] = result.best_diameter_m
+        best_genome = repair_genome(best_genome, opt_input)
     best_eval = evaluate_candidate(best_genome, opt_input, polar)
     evaluations = result.evaluations + 1
     step = 0.08
@@ -471,7 +556,13 @@ def run_ga_local_refine(
                 )
             for sign in (-1.0, 1.0):
                 trial = list(best_genome)
-                scale = opt_input.chord_max_ratio - opt_input.chord_min_ratio if idx < opt_input.control_points else opt_input.beta_max_deg - opt_input.beta_min_deg
+                if idx < count:
+                    scale = opt_input.chord_max_ratio - opt_input.chord_min_ratio
+                elif idx < count * 2:
+                    scale = opt_input.beta_max_deg - opt_input.beta_min_deg
+                else:
+                    diameter_min, diameter_max = _diameter_bounds(opt_input)
+                    scale = diameter_max - diameter_min
                 trial[idx] += sign * step * max(scale, 1e-9)
                 trial = repair_genome(trial, opt_input)
                 candidate = evaluate_candidate(trial, opt_input, polar)
@@ -516,6 +607,7 @@ def geometry_to_genome(geometry: list[GeometryStation], opt_input: TargetOptimiz
     control = make_control_radii(opt_input)
     genome = [interpolate_control_points(r, xs, chords) for r in control]
     genome.extend(interpolate_control_points(r, xs, betas) for r in control)
+    genome.append(_active_diameter_m(opt_input))
     return repair_genome(genome, opt_input)
 
 
@@ -646,11 +738,18 @@ def _mutate(
 
     count = max(opt_input.control_points, 2)
     out = list(genome)
+    diameter_min, diameter_max = _diameter_bounds(opt_input)
     chord_sigma = 0.15 * max(opt_input.chord_max_ratio - opt_input.chord_min_ratio, 1e-9)
     beta_sigma = 0.12 * max(opt_input.beta_max_deg - opt_input.beta_min_deg, 1e-9)
+    diameter_sigma = 0.10 * max(diameter_max - diameter_min, 1e-9)
     for idx, value in enumerate(out):
         if rng.random() <= opt_input.mutation_rate:
-            sigma = chord_sigma if idx < count else beta_sigma
+            if idx < count:
+                sigma = chord_sigma
+            elif idx < 2 * count:
+                sigma = beta_sigma
+            else:
+                sigma = diameter_sigma
             out[idx] = value + rng.gauss(0.0, sigma)
     return out
 
@@ -673,6 +772,7 @@ def _history_row(generation: int, evaluations: int, best: CandidateEvaluation) -
     return OptimizationHistoryRow(
         generation=int(generation),
         evaluations=int(evaluations),
+        best_diameter_m=finite_or_default(float(best.diagnostics.get("diameter_m", 0.0))),
         best_fitness=finite_or_default(best.fitness, LARGE_FITNESS),
         best_thrust_N=finite_or_default(analysis.thrust_N if analysis is not None else 0.0),
         best_torque_Nm=finite_or_default(analysis.torque_Nm if analysis is not None else 0.0),
@@ -704,14 +804,25 @@ def _result_from_best(
         prop_input = _propeller_input_from_optimizer(opt_input)
         geometry = _fallback_geometry(opt_input)
         analysis = calculate_propeller(prop_input, polar=GenericPolar(), geometry=geometry)
-        best = CandidateEvaluation([], geometry, analysis, LARGE_FITNESS, 1.0, {"invalid": LARGE_FITNESS}, {}, ["Fallback result used."])
+        best = CandidateEvaluation([], geometry, analysis, LARGE_FITNESS, 1.0, {"invalid": LARGE_FITNESS}, {"diameter_m": opt_input.diameter_m}, ["Fallback result used."])
     warnings = list(best.warnings)
+    best_diameter = genome_diameter_m(best.genome, opt_input)
+    if best_diameter <= 0.0:
+        best_diameter = finite_or_default(float(best.diagnostics.get("diameter_m", opt_input.diameter_m)), opt_input.diameter_m)
     if stopped:
         warnings.append("Optimization stopped by user.")
     if opt_input.target_mode == "match_torque":
         warnings.append("Torque matching alone is a load target, not an efficiency objective.")
+    if best.target_error_fraction > 0.25:
+        warnings.append(
+            "Best result remains far from the requested target; "
+            "the target may be infeasible with the current bounds, RPM, diameter, polar data, or limits."
+        )
+    if opt_input.power_limit_W > 0.0 and best.analysis.power_W > opt_input.power_limit_W:
+        warnings.append("Best result exceeds the requested power limit.")
     return TargetOptimizationResult(
         input=opt_input,
+        best_diameter_m=best_diameter,
         best_geometry=best.geometry,
         best_analysis=best.analysis,
         best_fitness=finite_or_default(best.fitness, LARGE_FITNESS),
@@ -733,7 +844,11 @@ def _fallback_geometry(opt_input: TargetOptimizationInput) -> list[GeometryStati
     return genome_to_geometry(genome, opt_input)
 
 
-def _airfoil_id_for_radius(r_over_R: float, opt_input: TargetOptimizationInput) -> str:
+def _airfoil_id_for_radius(
+    r_over_R: float,
+    opt_input: TargetOptimizationInput,
+    diameter_m: float | None = None,
+) -> str:
     """Return the root-to-tip airfoil id for one radius."""
 
     airfoils = [normalize_airfoil_id(item) for item in opt_input.airfoil_ids if normalize_airfoil_id(item)]
@@ -741,7 +856,7 @@ def _airfoil_id_for_radius(r_over_R: float, opt_input: TargetOptimizationInput) 
         return "active"
     if len(airfoils) == 1:
         return airfoils[0]
-    control = make_control_radii(opt_input)
+    control = make_control_radii(opt_input, diameter_m)
     span = max(control[-1] - control[0], 1e-9)
     fraction = clamp((r_over_R - control[0]) / span, 0.0, 0.999999)
     index = min(int(fraction * len(airfoils)), len(airfoils) - 1)

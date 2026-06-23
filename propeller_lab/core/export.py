@@ -110,6 +110,7 @@ def export_optimization_history_csv(result: TargetOptimizationResult, path: str 
     fieldnames = [
         "generation",
         "evaluations",
+        "best_diameter_m",
         "best_fitness",
         "best_thrust_N",
         "best_torque_Nm",
@@ -138,6 +139,7 @@ def export_optimization_summary_csv(result: TargetOptimizationResult, path: str 
     for key, value in asdict(result.input).items():
         rows.append({"section": "input", "name": key, "value": value})
     analysis = result.best_analysis
+    rows.append({"section": "best_result", "name": "best_diameter_m", "value": result.best_diameter_m})
     for key in ("thrust_N", "torque_Nm", "power_W", "eta", "ct", "cq", "cp"):
         rows.append({"section": "best_result", "name": key, "value": getattr(analysis, key)})
     rows.append({"section": "best_result", "name": "best_fitness", "value": result.best_fitness})
