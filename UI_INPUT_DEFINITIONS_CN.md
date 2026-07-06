@@ -2342,15 +2342,28 @@ Power limit, W
 
 作用与 Base Calculate 中 `Blades B` 相同。
 
-### 13.7 Diameter D, m
+### 13.7 Diameter mode 和直径输入
+
+UI 名称：
+
+```text
+Diameter mode
+```
 
 含义：
 
-目标优化使用的参考螺旋桨直径，单位 m。
+选择 Target Optimization 如何处理螺旋桨直径。
 
-当 `Diameter min D, m` 与 `Diameter max D, m` 相等时，优化使用固定直径。
+可选项：
 
-当 `Diameter min D, m` 小于 `Diameter max D, m` 时，优化器会把直径 D 也作为一个优化变量，在该范围内搜索最佳直径。
+- `Fixed diameter`：固定直径模式。界面只显示并启用 `Diameter D, m`，优化器不改变直径。
+- `Optimize diameter range`：直径范围优化模式。界面只显示并启用 `Diameter min D, m` 和 `Diameter max D, m`，优化器会在该范围内搜索最佳直径。
+
+#### Diameter D, m
+
+含义：
+
+固定直径模式下使用的螺旋桨直径，单位 m。
 
 要求：
 
@@ -2358,11 +2371,18 @@ Power limit, W
 Diameter D, m > Hub diameter, m
 ```
 
-### 13.8 Diameter min D, m
+固定直径模式下，程序会在内部令：
+
+```text
+Diameter min D, m = Diameter D, m
+Diameter max D, m = Diameter D, m
+```
+
+#### Diameter min D, m
 
 含义：
 
-目标优化允许搜索的最小螺旋桨直径，单位 m。
+直径范围优化模式下允许搜索的最小螺旋桨直径，单位 m。
 
 要求：
 
@@ -2375,11 +2395,11 @@ Diameter min D, m <= Diameter max D, m
 
 决定优化器可选直径范围下限。Reynolds 范围估算、几何站位半径、BEMT 分析都会覆盖该直径范围。
 
-### 13.9 Diameter max D, m
+#### Diameter max D, m
 
 含义：
 
-目标优化允许搜索的最大螺旋桨直径，单位 m。
+直径范围优化模式下允许搜索的最大螺旋桨直径，单位 m。
 
 作用：
 

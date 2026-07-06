@@ -690,9 +690,15 @@ class MainWindow(QMainWindow):
         self.target_torque_limit_spin = _spin_float(0.0, 1000000.0, 0.08, 5, 0.01)
         self.target_power_limit_spin = _spin_float(0.0, 100000000.0, 0.0, 3, 1.0)
         self.target_blades_spin = _spin_int(1, 12, 2)
+        self.target_diameter_mode_combo = QComboBox()
+        self.target_diameter_mode_combo.addItem("Fixed diameter", "fixed")
+        self.target_diameter_mode_combo.addItem("Optimize diameter range", "range")
         self.target_diameter_spin = _spin_float(0.001, 10.0, 0.254, 4, 0.001)
         self.target_diameter_min_spin = _spin_float(0.001, 10.0, 0.254, 4, 0.001)
         self.target_diameter_max_spin = _spin_float(0.001, 10.0, 0.254, 4, 0.001)
+        self.target_diameter_label = QLabel("Diameter D, m")
+        self.target_diameter_min_label = QLabel("Diameter min D, m")
+        self.target_diameter_max_label = QLabel("Diameter max D, m")
         self.target_hub_spin = _spin_float(0.0, 9.0, 0.035, 4, 0.001)
         self.target_rpm_spin = _spin_float(0.0, 200000.0, 8000.0, 1, 100.0)
         self.target_vinf_spin = _spin_float(0.0, 400.0, 0.0, 3, 0.1)
@@ -711,9 +717,10 @@ class MainWindow(QMainWindow):
         layout.addRow("Torque limit, N*m", self.target_torque_limit_spin)
         layout.addRow("Power limit, W", self.target_power_limit_spin)
         layout.addRow("Blades B", self.target_blades_spin)
-        layout.addRow("Diameter D, m", self.target_diameter_spin)
-        layout.addRow("Diameter min D, m", self.target_diameter_min_spin)
-        layout.addRow("Diameter max D, m", self.target_diameter_max_spin)
+        layout.addRow("Diameter mode", self.target_diameter_mode_combo)
+        layout.addRow(self.target_diameter_label, self.target_diameter_spin)
+        layout.addRow(self.target_diameter_min_label, self.target_diameter_min_spin)
+        layout.addRow(self.target_diameter_max_label, self.target_diameter_max_spin)
         layout.addRow("Hub diameter, m", self.target_hub_spin)
         layout.addRow("RPM", self.target_rpm_spin)
         layout.addRow("V_inf, m/s", self.target_vinf_spin)
@@ -725,8 +732,10 @@ class MainWindow(QMainWindow):
         layout.addRow(self.sync_target_base_button, self.use_target_polar_button)
 
         self.target_mode_combo.currentIndexChanged.connect(self._update_target_mode_controls)
+        self.target_diameter_mode_combo.currentIndexChanged.connect(self._update_target_diameter_mode_controls)
         self.sync_target_base_button.clicked.connect(self._sync_target_from_base)
         self.use_target_polar_button.clicked.connect(self._refresh_target_polar_label)
+        self._update_target_diameter_mode_controls()
         return group
 
     def _target_airfoil_group(self) -> QGroupBox:
@@ -1127,6 +1136,8 @@ class MainWindow(QMainWindow):
             _set_spin_value_silently(self.target_torque_spin, max(self.current_result.torque_Nm, 0.0))
             _set_spin_value_silently(self.target_torque_limit_spin, max(self.current_result.torque_Nm * 1.1, 0.0))
             _set_spin_value_silently(self.target_power_limit_spin, max(self.current_result.power_W * 1.25, 0.0))
+        self.target_diameter_mode_combo.setCurrentIndex(0)
+        self._update_target_diameter_mode_controls()
         self._refresh_target_polar_label()
 
     def _refresh_target_polar_label(self) -> None:
@@ -1165,6 +1176,30 @@ class MainWindow(QMainWindow):
         self.target_thrust_spin.setEnabled(uses_thrust)
         self.target_torque_spin.setEnabled(uses_torque)
         self.target_torque_limit_spin.setEnabled(uses_torque_limit)
+
+    def _target_diameter_mode(self) -> str:
+        """Return the selected target diameter handling mode."""
+
+        return str(self.target_diameter_mode_combo.currentData())
+
+    def _update_target_diameter_mode_controls(self, *_args: object) -> None:
+        """Show only the diameter inputs needed by the selected mode."""
+
+        range_mode = self._target_diameter_mode() == "range"
+        fixed_widgets = (self.target_diameter_label, self.target_diameter_spin)
+        range_widgets = (
+            self.target_diameter_min_label,
+            self.target_diameter_min_spin,
+            self.target_diameter_max_label,
+            self.target_diameter_max_spin,
+        )
+        for widget in fixed_widgets:
+            widget.setVisible(not range_mode)
+        for widget in range_widgets:
+            widget.setVisible(range_mode)
+        self.target_diameter_spin.setEnabled(not range_mode)
+        self.target_diameter_min_spin.setEnabled(range_mode)
+        self.target_diameter_max_spin.setEnabled(range_mode)
 
     def _target_airfoil_source(self) -> str:
         """Return the selected target airfoil source type."""
@@ -1371,12 +1406,20 @@ class MainWindow(QMainWindow):
     def _target_optimization_input(self) -> TargetOptimizationInput:
         """Read TargetOptimizationInput from controls."""
 
-        if self.target_diameter_spin.value() <= self.target_hub_spin.value():
-            raise ValueError("Diameter must be greater than hub diameter.")
-        if self.target_diameter_min_spin.value() > self.target_diameter_max_spin.value():
-            raise ValueError("Diameter min must be smaller than or equal to diameter max.")
-        if self.target_diameter_min_spin.value() <= self.target_hub_spin.value():
-            raise ValueError("Diameter min must be greater than hub diameter.")
+        if self._target_diameter_mode() == "range":
+            diameter_min_m = self.target_diameter_min_spin.value()
+            diameter_max_m = self.target_diameter_max_spin.value()
+            if diameter_min_m > diameter_max_m:
+                raise ValueError("Diameter min must be smaller than or equal to diameter max.")
+            if diameter_min_m <= self.target_hub_spin.value():
+                raise ValueError("Diameter min must be greater than hub diameter.")
+            diameter_m = 0.5 * (diameter_min_m + diameter_max_m)
+        else:
+            diameter_m = self.target_diameter_spin.value()
+            if diameter_m <= self.target_hub_spin.value():
+                raise ValueError("Diameter must be greater than hub diameter.")
+            diameter_min_m = diameter_m
+            diameter_max_m = diameter_m
         if self.target_chord_min_spin.value() >= self.target_chord_max_spin.value():
             raise ValueError("Chord min must be smaller than chord max.")
         if self.target_beta_min_spin.value() >= self.target_beta_max_spin.value():
@@ -1390,9 +1433,9 @@ class MainWindow(QMainWindow):
             torque_limit_Nm=self.target_torque_limit_spin.value(),
             power_limit_W=self.target_power_limit_spin.value(),
             blades=self.target_blades_spin.value(),
-            diameter_m=self.target_diameter_spin.value(),
-            diameter_min_m=self.target_diameter_min_spin.value(),
-            diameter_max_m=self.target_diameter_max_spin.value(),
+            diameter_m=diameter_m,
+            diameter_min_m=diameter_min_m,
+            diameter_max_m=diameter_max_m,
             hub_diameter_m=self.target_hub_spin.value(),
             rpm=self.target_rpm_spin.value(),
             v_inf=self.target_vinf_spin.value(),
@@ -1480,6 +1523,8 @@ class MainWindow(QMainWindow):
         self._fill_target_history_table([])
         self._fill_target_geometry_table([])
         self._fill_target_airfoil_comparison_table([])
+        self.start_target_button.setText("Start optimization")
+        self.stop_target_button.setText("Stop")
         self.start_target_button.setEnabled(False)
         self.stop_target_button.setEnabled(True)
         self.optimization_thread = QThread(self)
@@ -1505,8 +1550,11 @@ class MainWindow(QMainWindow):
     def stop_target_optimization(self) -> None:
         """Request target optimization stop."""
 
-        if self.optimization_worker is not None:
-            self.optimization_worker.request_stop()
+        if self.optimization_worker is None:
+            return
+        self.optimization_worker.request_stop()
+        self._append_target_log("Stop requested. Waiting for the current station/candidate to stop safely.")
+        self.stop_target_button.setText("Stopping...")
         self.stop_target_button.setEnabled(False)
 
     def _target_optimization_progress(self, generation: int, total: int, best: object) -> None:
@@ -1612,6 +1660,8 @@ class MainWindow(QMainWindow):
         """Release target optimization worker references."""
 
         self.start_target_button.setEnabled(True)
+        self.start_target_button.setText("Start optimization")
+        self.stop_target_button.setText("Stop")
         self.stop_target_button.setEnabled(False)
         if self.optimization_worker is not None:
             self.optimization_worker.deleteLater()

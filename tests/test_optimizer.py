@@ -197,6 +197,33 @@ def test_unreachable_target_returns_warning_not_crash():
     _assert_no_invalid_numbers(result)
 
 
+def test_stop_callback_interrupts_current_candidate():
+    """Stop requests should interrupt long station evaluations, not only generation boundaries."""
+
+    calls = 0
+
+    def stop_requested() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls >= 3
+
+    result = run_target_optimization(
+        _opt_input(
+            elements=30,
+            population_size=3,
+            generations=3,
+            optimizer_method="random_search",
+        ),
+        polar=_multi_re_polar(),
+        stop_callback=stop_requested,
+    )
+
+    assert calls >= 3
+    assert result.best_analysis is not None
+    assert any("Optimization stopped by user." in warning for warning in result.warnings)
+    _assert_no_invalid_numbers(result)
+
+
 def test_imported_sample_polar_works_with_optimizer():
     """Imported sample polar should work with target optimization."""
 
@@ -350,6 +377,7 @@ def test_main_window_target_optimization_workspace_smoke(tmp_path):
     assert window.workspace_stack.currentIndex() == 2
     assert hasattr(window, "start_target_button")
     assert hasattr(window, "target_mode_combo")
+    assert hasattr(window, "target_diameter_mode_combo")
     assert hasattr(window, "target_diameter_min_spin")
     assert hasattr(window, "target_diameter_max_spin")
     assert hasattr(window, "target_airfoil_codes_edit")
@@ -359,6 +387,13 @@ def test_main_window_target_optimization_workspace_smoke(tmp_path):
     assert hasattr(window, "target_build_xfoil_button")
     assert hasattr(window, "target_airfoil_comparison_table")
     assert window.target_thrust_spin.isEnabled()
+    assert window._target_diameter_mode() == "fixed"
+    assert window.target_diameter_spin.isEnabled()
+    assert not window.target_diameter_spin.isHidden()
+    assert not window.target_diameter_min_spin.isEnabled()
+    assert window.target_diameter_min_spin.isHidden()
+    assert not window.target_diameter_max_spin.isEnabled()
+    assert window.target_diameter_max_spin.isHidden()
     window.target_airfoil_codes_edit.setText("4412, 2412")
     assert window._target_airfoil_ids() == ["naca4412", "naca2412"]
     window.target_airfoil_mode_combo.setCurrentIndex(1)
@@ -387,9 +422,18 @@ def test_main_window_target_optimization_workspace_smoke(tmp_path):
         ("dat", str(tip_dat)),
     ]
     window.target_airfoil_source_combo.setCurrentIndex(0)
+    window.target_diameter_mode_combo.setCurrentIndex(window.target_diameter_mode_combo.findData("range"))
+    assert window._target_diameter_mode() == "range"
+    assert not window.target_diameter_spin.isEnabled()
+    assert window.target_diameter_spin.isHidden()
+    assert window.target_diameter_min_spin.isEnabled()
+    assert not window.target_diameter_min_spin.isHidden()
+    assert window.target_diameter_max_spin.isEnabled()
+    assert not window.target_diameter_max_spin.isHidden()
     window.target_diameter_min_spin.setValue(0.2)
     window.target_diameter_max_spin.setValue(0.5)
     opt_input = window._target_optimization_input()
+    assert math.isclose(opt_input.diameter_m, 0.35, rel_tol=1e-12)
     assert math.isclose(opt_input.diameter_min_m, 0.2, rel_tol=1e-12)
     assert math.isclose(opt_input.diameter_max_m, 0.5, rel_tol=1e-12)
     window.estimate_target_optimization_re_range()

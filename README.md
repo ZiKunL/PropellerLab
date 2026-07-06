@@ -154,7 +154,7 @@ This feature is a bounded engineering search, not a guaranteed global optimum. R
 Recommended workflow:
 
 1. Open Target Optimization and copy Base Calculate inputs if they are already set.
-2. Enter target thrust or torque, fixed RPM, V_inf, blade count, reference diameter, optional diameter min/max range, and geometry bounds.
+2. Enter target thrust or torque, fixed RPM, V_inf, blade count, geometry bounds, and choose either a fixed diameter or an optimized diameter min/max range.
 3. For a single airfoil, use GenericPolar, import a polar CSV, or generate a normal XFOIL polar first.
 4. For hybrid airfoils, choose Hybrid root-to-tip, enter the airfoils in root-to-tip order, estimate the optimization Re range, then build target XFOIL polars.
 5. For uniform-airfoil comparison, choose Compare uniform airfoils, enter NACA candidates, DAT files such as Clark Y coordinates, or both, estimate the optimization Re range, then build target XFOIL polars.

@@ -7,7 +7,7 @@ import random
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from .bemt import calculate_propeller
+from .bemt import CalculationStopped, calculate_propeller
 from .geometry import validate_geometry
 from .models import GeometryStation, PropellerInput, PropellerResult
 from .numerics import clamp, finite_or_default, is_finite_number, safe_div
@@ -344,9 +344,12 @@ def evaluate_candidate(
     genome: list[float],
     opt_input: TargetOptimizationInput,
     polar: AirfoilPolar | None = None,
+    stop_callback: StopCallback | None = None,
 ) -> CandidateEvaluation:
     """Evaluate one candidate using the existing propeller solver."""
 
+    if stop_callback is not None and stop_callback():
+        raise CalculationStopped("Target optimization stopped by user.")
     polar_model = polar if polar is not None else GenericPolar()
     clean = repair_genome(genome, opt_input)
     diameter = genome_diameter_m(clean, opt_input)
@@ -354,7 +357,7 @@ def evaluate_candidate(
     try:
         geometry = genome_to_geometry(clean, candidate_input)
         prop_input = _propeller_input_from_optimizer(candidate_input)
-        analysis = calculate_propeller(prop_input, polar=polar_model, geometry=geometry)
+        analysis = calculate_propeller(prop_input, polar=polar_model, geometry=geometry, stop_callback=stop_callback)
         diagnostics = _analysis_diagnostics(analysis, candidate_input, geometry)
         diagnostics["diameter_m"] = diameter
         fitness, target_error, penalties, warnings = compute_fitness(analysis, candidate_input, geometry, diagnostics)
@@ -362,6 +365,8 @@ def evaluate_candidate(
         return _clean_evaluation(
             CandidateEvaluation(clean, geometry, analysis, fitness, target_error, penalties, diagnostics, _unique(warnings))
         )
+    except CalculationStopped:
+        raise
     except Exception as exc:  # noqa: BLE001 - optimizer keeps running on bad candidates.
         geometry = _fallback_geometry(opt_input)
         diagnostics = {"error": str(exc)}
@@ -464,7 +469,11 @@ def run_random_search(
             if stop_callback is not None and stop_callback():
                 stopped = True
                 break
-            candidate = evaluate_candidate(genome, opt_input, polar)
+            try:
+                candidate = evaluate_candidate(genome, opt_input, polar, stop_callback)
+            except CalculationStopped:
+                stopped = True
+                break
             evaluations += 1
             best = _best_candidate(best, candidate)
         if best is not None:
@@ -503,7 +512,11 @@ def run_genetic_algorithm(
             if stop_callback is not None and stop_callback():
                 stopped = True
                 break
-            candidate = evaluate_candidate(genome, opt_input, polar)
+            try:
+                candidate = evaluate_candidate(genome, opt_input, polar, stop_callback)
+            except CalculationStopped:
+                stopped = True
+                break
             evaluated.append(candidate)
             evaluations += 1
             best = _best_candidate(best, candidate)
@@ -536,11 +549,13 @@ def run_ga_local_refine(
 
     count = max(int(opt_input.control_points), 2)
     result = run_genetic_algorithm(opt_input, polar, progress_callback, stop_callback, base_geometry)
+    if stop_callback is not None and stop_callback():
+        return result
     best_genome = geometry_to_genome(result.best_geometry, opt_input)
     if len(best_genome) >= genome_length(opt_input):
         best_genome[-1] = result.best_diameter_m
         best_genome = repair_genome(best_genome, opt_input)
-    best_eval = evaluate_candidate(best_genome, opt_input, polar)
+    best_eval = evaluate_candidate(best_genome, opt_input, polar, stop_callback)
     evaluations = result.evaluations + 1
     step = 0.08
     for _pass in range(2):
@@ -565,7 +580,16 @@ def run_ga_local_refine(
                     scale = diameter_max - diameter_min
                 trial[idx] += sign * step * max(scale, 1e-9)
                 trial = repair_genome(trial, opt_input)
-                candidate = evaluate_candidate(trial, opt_input, polar)
+                try:
+                    candidate = evaluate_candidate(trial, opt_input, polar, stop_callback)
+                except CalculationStopped:
+                    return _result_from_best(
+                        opt_input,
+                        best_eval,
+                        result.history,
+                        evaluations,
+                        stopped=True,
+                    )
                 evaluations += 1
                 if candidate.fitness < best_eval.fitness:
                     best_eval = candidate

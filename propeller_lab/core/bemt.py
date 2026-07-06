@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import replace
 
 from .geometry import generate_pitch_geometry, validate_geometry
@@ -17,11 +18,18 @@ from .numerics import (
 )
 from .polar import AirfoilPolar, GenericPolar
 
+StopCallback = Callable[[], bool]
+
+
+class CalculationStopped(Exception):
+    """Raised when a long-running propeller calculation is stopped by the caller."""
+
 
 def calculate_propeller(
     inp: PropellerInput,
     polar: AirfoilPolar | None = None,
     geometry: list[GeometryStation] | None = None,
+    stop_callback: StopCallback | None = None,
 ) -> PropellerResult:
     """Calculate integrated propeller performance."""
 
@@ -39,13 +47,13 @@ def calculate_propeller(
         )
 
     if actual_mode == "simple":
-        station_results = calculate_simple(inp, polar_model, stations)
+        station_results = calculate_simple(inp, polar_model, stations, stop_callback)
     elif actual_mode == "simple_induced":
-        station_results = calculate_simple_induced(inp, polar_model, stations)
+        station_results = calculate_simple_induced(inp, polar_model, stations, stop_callback)
     elif actual_mode == "bemt_phi_forward":
-        station_results = calculate_bemt_phi_forward(inp, polar_model, stations)
+        station_results = calculate_bemt_phi_forward(inp, polar_model, stations, stop_callback)
     elif actual_mode == "bemt_hover_dimensional":
-        station_results = calculate_bemt_hover_dimensional(inp, polar_model, stations)
+        station_results = calculate_bemt_hover_dimensional(inp, polar_model, stations, stop_callback)
     else:
         raise ValueError(f"Unknown calculation_mode: {inp.calculation_mode}")
     return _integrate_result(inp, station_results, requested_mode, actual_mode, extra_warnings)
@@ -90,16 +98,25 @@ def _advance_metrics(inp: PropellerInput) -> dict[str, float]:
     }
 
 
+def _raise_if_stopped(stop_callback: StopCallback | None) -> None:
+    """Abort a long calculation at a station boundary when requested."""
+
+    if stop_callback is not None and stop_callback():
+        raise CalculationStopped("Propeller calculation stopped by user.")
+
+
 def calculate_simple(
     inp: PropellerInput,
     polar: AirfoilPolar,
     geometry: list[GeometryStation],
+    stop_callback: StopCallback | None = None,
 ) -> list[StationResult]:
     """Calculate stations without induced velocity."""
 
     geometry_data = _prepare_geometry(inp, geometry)
     results: list[StationResult] = []
     for station, r_m, dr_m in geometry_data:
+        _raise_if_stopped(stop_callback)
         result = _station_from_velocity(inp, polar, station, r_m, dr_m, vi_mps=0.0, loss_factor=1.0)
         results.append(result)
     return results
@@ -109,46 +126,57 @@ def calculate_simple_induced(
     inp: PropellerInput,
     polar: AirfoilPolar,
     geometry: list[GeometryStation],
+    stop_callback: StopCallback | None = None,
 ) -> list[StationResult]:
     """Calculate stations with a local axial induced-velocity iteration."""
 
     geometry_data = _prepare_geometry(inp, geometry)
-    return [_induced_station(inp, polar, station, r_m, dr_m, "") for station, r_m, dr_m in geometry_data]
+    results: list[StationResult] = []
+    for station, r_m, dr_m in geometry_data:
+        _raise_if_stopped(stop_callback)
+        results.append(_induced_station(inp, polar, station, r_m, dr_m, ""))
+    return results
 
 
 def calculate_bemt_phi(
     inp: PropellerInput,
     polar: AirfoilPolar,
     geometry: list[GeometryStation],
+    stop_callback: StopCallback | None = None,
 ) -> list[StationResult]:
     """Backward-compatible alias for the forward-flight phi solver."""
 
-    return calculate_bemt_phi_forward(inp, polar, geometry)
+    return calculate_bemt_phi_forward(inp, polar, geometry, stop_callback)
 
 
 def calculate_bemt_phi_forward(
     inp: PropellerInput,
     polar: AirfoilPolar,
     geometry: list[GeometryStation],
+    stop_callback: StopCallback | None = None,
 ) -> list[StationResult]:
     """Calculate stations with a forward-flight phi-based BEMT solve."""
 
     geometry_data = _prepare_geometry(inp, geometry)
     if inp.v_inf <= 1e-6:
-        return [
-            _induced_station(
-                inp,
-                polar,
-                station,
-                r_m,
-                dr_m,
-                "Static condition: phi-BEMT fallback to induced blade-element station.",
+        results: list[StationResult] = []
+        for station, r_m, dr_m in geometry_data:
+            _raise_if_stopped(stop_callback)
+            results.append(
+                _induced_station(
+                    inp,
+                    polar,
+                    station,
+                    r_m,
+                    dr_m,
+                    "Static condition: phi-BEMT fallback to induced blade-element station.",
+                )
             )
-            for station, r_m, dr_m in geometry_data
-        ]
+        return results
 
     results: list[StationResult] = []
     for station, r_m, dr_m in geometry_data:
+        _raise_if_stopped(stop_callback)
         try:
             results.append(_phi_station(inp, polar, station, r_m, dr_m))
         except Exception as exc:  # noqa: BLE001 - station fallback keeps the UI usable.
@@ -160,11 +188,16 @@ def calculate_bemt_hover_dimensional(
     inp: PropellerInput,
     polar: AirfoilPolar,
     geometry: list[GeometryStation],
+    stop_callback: StopCallback | None = None,
 ) -> list[StationResult]:
     """Calculate stations by solving dimensional axial induced velocity."""
 
     geometry_data = _prepare_geometry(inp, geometry)
-    return [_hover_dimensional_station(inp, polar, station, r_m, dr_m) for station, r_m, dr_m in geometry_data]
+    results: list[StationResult] = []
+    for station, r_m, dr_m in geometry_data:
+        _raise_if_stopped(stop_callback)
+        results.append(_hover_dimensional_station(inp, polar, station, r_m, dr_m))
+    return results
 
 
 def prandtl_loss_factor(

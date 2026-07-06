@@ -229,21 +229,21 @@ data\designs\
 
 ### 9.2 直径范围优化
 
-Target Optimization 中有三个直径相关输入：
+Target Optimization 中通过 `Diameter mode` 选择直径处理方式：
 
-- `Diameter D, m`：参考直径
-- `Diameter min D, m`：允许搜索的最小直径
-- `Diameter max D, m`：允许搜索的最大直径
+- `Fixed diameter`：只显示并启用 `Diameter D, m`，优化过程中直径保持固定。
+- `Optimize diameter range`：只显示并启用 `Diameter min D, m` 和 `Diameter max D, m`，优化器会在该范围内选择直径。
 
-若要固定直径：
+若要固定直径，选择：
 
 ```text
-Diameter min D, m = Diameter max D, m
+Diameter mode = Fixed diameter
 ```
 
-若要让优化器自动选择直径：
+若要让优化器自动选择直径，选择：
 
 ```text
+Diameter mode = Optimize diameter range
 Diameter min D, m < Diameter max D, m
 ```
 
@@ -400,4 +400,3 @@ alpha step = 1
 - 高迎角、低 Reynolds、高 Mach 和失速后结果需要谨慎。
 - 优化结果依赖 polar 质量、边界范围、目标权重和随机种子。
 - 重要设计必须通过实验或更高保真工具验证。
-
